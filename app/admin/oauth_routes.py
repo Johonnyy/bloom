@@ -82,12 +82,25 @@ async def list_providers() -> list[dict]:
     ``configured`` is the difference between "a manifest ships in the image" and
     "client credentials exist in this deployment" — which is what lets Aperture
     grey out a Connect button with a reason rather than failing at the redirect.
+
+    The two ``*_env`` names are what make that reason *actionable*. Adding a provider
+    is meant to be one file in ``app/providers/`` and nothing else anywhere — but until
+    these were reported, the deployment tooling had to enumerate every provider's
+    client credentials by hand, so every new connection needed an amber-infra release
+    to go with it. The manifest already declares which variables it reads; saying so
+    over the API is what lets Aperture offer to fill them without knowing in advance
+    that this provider exists.
+
+    Names, never values. They are public — committed in the provider's own TOML — and
+    the value is read from the process environment and stays there.
     """
     return [
         {
             "name": p.name,
             "display_name": p.display_name,
             "configured": p.configured,
+            "client_id_env": p.client_id_env,
+            "client_secret_env": p.client_secret_env,
             "scopes_default": list(p.scopes_default),
             "operations": [op.tool_name(p.name) for op in p.operations],
             "docs_url": p.docs_url,
