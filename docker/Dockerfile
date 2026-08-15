@@ -53,9 +53,27 @@ COPY --from=builder /opt/venv /opt/venv
 WORKDIR /srv
 COPY --chown=appuser:appuser . .
 
-# The SQLite usage log lives here. Mount a volume over it in compose or the log
-# is lost on every restart.
-RUN mkdir -p /srv/data && chown appuser:appuser /srv/data
+# Two data directories, and both have to exist *before* USER appuser.
+#
+# /srv/data is the dev default: `db_path` defaults to the relative `data/bloom.db`
+# and WORKDIR is /srv, so a local run without a volume lands here.
+#
+# /data is where the deployment actually mounts bloom-data, and it is the one that
+# was missing. Docker only seeds a fresh named volume — content *and* ownership —
+# from a path that already exists in the image. `/data` did not, so Docker created
+# the mount point itself, root-owned, and the container runs as uid 10001: SQLite
+# could not create bloom.db, uvicorn died at startup, and the only symptom was the
+# healthcheck going `unhealthy` two minutes into an otherwise clean install.
+#
+# amber_v2's Dockerfile has always done this (`mkdir -p /data /signals` + chown +
+# `VOLUME ["/data"]`), which is why Amber deploys on the same convention and Bloom
+# did not.
+RUN mkdir -p /srv/data /data \
+    && chown appuser:appuser /srv/data /data
+
+# Declared so the intent survives someone running this image without compose, and
+# so the ownership above is what a fresh anonymous volume inherits too.
+VOLUME ["/data"]
 
 USER appuser
 EXPOSE 8010
