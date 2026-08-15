@@ -110,21 +110,26 @@ def _install_fake_runner(monkeypatch, runner: FakeRunner) -> dict:
     return state
 
 
-def _wait_for_terminal(client, config_id: str, run_id: str, tries: int = 100) -> dict:
-    """Poll the trace until the run is no longer `running`.
+def _wait_for_terminal(client, config_id: str, run_id: str, tries: int = 200) -> dict:
+    """Poll the trace until the terminal event has landed.
 
-    The run is a background task, so a test that read once would race it. Polling
-    the real endpoint is also the only way to assert the endpoint stays correct
-    while a run is in flight.
+    Waits for the **event**, not the row, because the two are not written together:
+    `finish_run` updates the row synchronously while `run_finished` is only queued
+    for the background trace writer. A test that stopped at the row would read a
+    trace that is briefly missing its last event — and would fail intermittently, on
+    a timing window a real client never sees because it waits for the event too.
     """
     import time
 
+    body: dict = {}
     for _ in range(tries):
         body = client.get(f"/admin/agents/{config_id}/runs/{run_id}/trace", headers=AUTH).json()
-        if body["run"]["status"] != "running":
+        finished = body["run"]["status"] != "running"
+        landed = any(e["kind"] == "run_finished" for e in body["events"])
+        if finished and landed:
             return body
-        time.sleep(0.05)
-    raise AssertionError(f"run {run_id} never finished: {body['run']}")
+        time.sleep(0.02)
+    raise AssertionError(f"run {run_id} never finished: {body.get('run')}")
 
 
 # --- the happy path ---------------------------------------------------------
@@ -510,3 +515,215 @@ def test_a_full_trace_queue_drops_events_rather_than_blocking_the_run(tmp_path):
     assert writer._queue.qsize() == 2
     assert writer._dropped == 48
     store.close()
+
+
+# --- cancellation -----------------------------------------------------------
+#
+# `cancelled` was a status the schema declared and nothing could produce. These
+# cover the endpoint that closes that gap, and the two ways it must say no.
+
+
+def _wait_until(predicate, message: str, timeout_s: float = 10.0) -> None:
+    """Block until ``predicate()`` is true, or fail saying what never happened.
+
+    Generous, and deliberately so: the whole suite shares a machine, and a timeout
+    tuned to an idle laptop is a test that fails for everyone else. What matters is
+    that it *asserts* rather than falling through — a silent fall-through here would
+    surface later as a confusing 409 from an endpoint that is working correctly.
+    """
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise AssertionError(message)
+
+
+class SlowRunner:
+    """Blocks until cancelled, so a test can catch a run mid-flight."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def run(self, prompt, *, conversation_id=None, depth=0, on_sentence=None, **kw):
+        self.started.set()
+        await asyncio.sleep(30)  # cancelled long before this returns
+        raise AssertionError("the run should have been cancelled")
+
+
+def test_a_running_run_can_be_cancelled_and_ends_with_a_terminal_event(client, monkeypatch):
+    runner = SlowRunner()
+    _install_fake_runner(monkeypatch, runner)
+    agent = _make_agent(client)
+
+    run_id = client.post(
+        f"/admin/agents/{agent['id']}/test-run", headers=AUTH, json={"input": "wait"}
+    ).json()["run_id"]
+
+    # Wait for the run to actually be executing, and **assert** it got there.
+    # `test-run` answers 202 as soon as the task is scheduled, so there is a real
+    # window before `execute_run` registers itself — cancelling inside that window is
+    # a different code path (the 409 two tests below), and a test that cancelled
+    # anyway would fail intermittently while looking like a bug in the endpoint.
+    _wait_until(
+        lambda: run_id in runtime_service.in_flight_ids(),
+        f"run {run_id} never reached the in-flight registry",
+    )
+
+    stopped = client.post(f"/admin/runs/{run_id}/cancel", headers=AUTH)
+    # 202, not 200: cancellation is a request, and the outcome arrives on the trace.
+    assert stopped.status_code == 202, stopped.text
+    assert stopped.json()["status"] == "cancelling"
+
+    body = _wait_for_terminal(client, agent["id"], run_id)
+    assert body["run"]["status"] == "cancelled"
+    # The terminal event still has to exist, or a client tailing the stream hangs on
+    # a run that has already stopped.
+    assert body["events"][-1]["kind"] == "run_finished"
+    assert body["events"][-1]["payload"]["status"] == "cancelled"
+
+    # And the registry is clean, so a later run cannot inherit a stale task.
+    assert run_id not in runtime_service.in_flight_ids()
+
+
+def test_cancelling_a_finished_run_is_a_conflict_not_a_not_found(client, monkeypatch):
+    """The run exists; it just cannot be cancelled. Telling those apart is what lets
+    a UI say "it already finished" rather than "no such run"."""
+    _install_fake_runner(monkeypatch, FakeRunner())
+    agent = _make_agent(client)
+    run_id = client.post(
+        f"/admin/agents/{agent['id']}/test-run", headers=AUTH, json={"input": "hi"}
+    ).json()["run_id"]
+    _wait_for_terminal(client, agent["id"], run_id)
+
+    late = client.post(f"/admin/runs/{run_id}/cancel", headers=AUTH)
+    assert late.status_code == 409
+    assert late.json()["error"] == "conflict"
+    assert "already finished" in late.json()["message"]
+
+
+def test_cancelling_an_unknown_run_is_a_404(client):
+    assert client.post("/admin/runs/nope/cancel", headers=AUTH).status_code == 404
+
+
+def test_a_run_this_process_is_not_executing_cannot_be_cancelled_here(client, tmp_path):
+    """A row left `running` by a dead process, before the startup sweep reaches it."""
+    store = db_module.get_store()
+    config = store.create_config(slug="orphan")
+    store.create_run(run_id="ghost", agent_config_id=config["id"], prompt="p", origin="mcp")
+
+    refused = client.post("/admin/runs/ghost/cancel", headers=AUTH)
+    assert refused.status_code == 409
+    assert "not executing in this process" in refused.json()["message"]
+
+
+# --- the global activity feed -----------------------------------------------
+
+
+def test_the_global_feed_orders_across_agents_and_carries_the_slug(client, monkeypatch):
+    """The reason this endpoint exists: per-agent pages cannot be interleaved
+    correctly without fetching all of them."""
+    _install_fake_runner(monkeypatch, FakeRunner())
+    first = _make_agent(client, slug="alpha")
+    second = _make_agent(client, slug="beta")
+
+    ids = []
+    for agent in (first, second, first):
+        run_id = client.post(
+            f"/admin/agents/{agent['id']}/test-run", headers=AUTH, json={"input": "hi"}
+        ).json()["run_id"]
+        _wait_for_terminal(client, agent["id"], run_id)
+        ids.append(run_id)
+
+    feed = client.get("/admin/runs", headers=AUTH).json()
+    assert len(feed) == 3
+    assert {r["agent_slug"] for r in feed} == {"alpha", "beta"}
+    # Newest first, across both agents.
+    assert [r["started_at"] for r in feed] == sorted((r["started_at"] for r in feed), reverse=True)
+
+
+def test_the_global_feed_filters_by_status_and_origin(client, monkeypatch):
+    _install_fake_runner(monkeypatch, FakeRunner())
+    agent = _make_agent(client)
+    run_id = client.post(
+        f"/admin/agents/{agent['id']}/test-run", headers=AUTH, json={"input": "hi"}
+    ).json()["run_id"]
+    _wait_for_terminal(client, agent["id"], run_id)
+
+    assert len(client.get("/admin/runs?origin=test_run", headers=AUTH).json()) == 1
+    assert client.get("/admin/runs?origin=mcp", headers=AUTH).json() == []
+    assert len(client.get("/admin/runs?status=succeeded", headers=AUTH).json()) == 1
+    assert client.get("/admin/runs?status=failed", headers=AUTH).json() == []
+    assert run_id  # the run above is the one being filtered
+
+
+def test_a_run_whose_config_was_deleted_still_appears_in_the_feed(client, monkeypatch):
+    """History outlives configuration. A LEFT JOIN leaves the slug null rather than
+    dropping the row, which would make spend vanish along with the agent."""
+    _install_fake_runner(monkeypatch, FakeRunner())
+    agent = _make_agent(client)
+    run_id = client.post(
+        f"/admin/agents/{agent['id']}/test-run", headers=AUTH, json={"input": "hi"}
+    ).json()["run_id"]
+    _wait_for_terminal(client, agent["id"], run_id)
+
+    client.delete(f"/admin/agents/{agent['id']}", headers=AUTH)
+
+    feed = client.get("/admin/runs", headers=AUTH).json()
+    assert [r["id"] for r in feed] == [run_id]
+    assert feed[0]["agent_slug"] is None
+
+
+# --- the terminal-event grace period ----------------------------------------
+
+
+def test_a_just_finished_run_is_not_yet_settled_so_the_stream_waits(client):
+    """The row and the terminal event are not written together.
+
+    `finish_run` writes the row synchronously; `run_finished` is only queued for the
+    background writer. The stream's safety net must not fire in that window, or it
+    synthesizes a terminal event without the real one's cost and stopped_by and
+    closes just before the real one arrives — a client gets a worse answer *because*
+    it was watching closely.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.admin import runs as runs_module
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    assert runs_module._settled({"finished_at": now.isoformat()}) is False
+
+    old = now - timedelta(seconds=runs_module._TERMINAL_GRACE_S + 1)
+    assert runs_module._settled({"finished_at": old.isoformat()}) is True
+
+
+def test_a_run_with_no_usable_finished_at_counts_as_settled(client):
+    """This gates a safety net. Failing closed on a malformed timestamp would hold a
+    stream open forever, which is the failure the net exists to prevent."""
+    from app.admin import runs as runs_module
+
+    assert runs_module._settled({"finished_at": None}) is True
+    assert runs_module._settled({}) is True
+    assert runs_module._settled({"finished_at": "not a timestamp"}) is True
+
+
+def test_the_stream_still_closes_a_run_whose_terminal_event_was_lost(client, tmp_path):
+    """The abandoned case the net exists for: an old finished row, no event."""
+    from datetime import UTC, datetime, timedelta
+
+    store = db_module.get_store()
+    config = store.create_config(slug="lost")
+    store.create_run(run_id="lost1", agent_config_id=config["id"], prompt="p", origin="mcp")
+    store.finish_run("lost1", status="abandoned")
+    # Backdate past the grace window rather than sleeping through it.
+    long_ago = (datetime.now(UTC) - timedelta(minutes=5)).replace(microsecond=0).isoformat()
+    store._conn.execute("UPDATE runs SET finished_at = ? WHERE id = ?", (long_ago, "lost1"))
+    store._conn.commit()
+
+    with client.stream("GET", "/admin/runs/lost1/events", headers=AUTH) as response:
+        body = "".join(response.iter_text())
+
+    assert "event: run_finished" in body
+    assert "abandoned" in body

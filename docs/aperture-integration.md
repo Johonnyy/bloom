@@ -76,9 +76,22 @@ Two validation behaviours worth building UI around:
 ```
 POST /admin/agents/{id}/test-run     {"input": "…"}   202 → {run_id, status, stream_url, trace_url}
 GET  /admin/runs/{run_id}/events                      200 text/event-stream
+POST /admin/runs/{run_id}/cancel                      202 → {run_id, status: "cancelling"}
 GET  /admin/agents/{id}/runs/{run_id}/trace           200 → {run, events[]}
 GET  /admin/agents/{id}/runs?limit=&offset=           200 → run[]
+GET  /admin/runs?limit=&offset=&status=&origin=       200 → run[]   (every agent)
 ```
+
+`stream_url` and `trace_url` come back as **relative paths** — join them to the base
+URL rather than using them directly.
+
+**Stop** is `POST /admin/runs/{id}/cancel`. It answers `202`, not `200`, because
+cancellation is a request rather than an act: the outcome arrives on the trace as
+`run_finished{status: "cancelled"}`, the same terminal event every other ending
+produces, so a client that waits for the event needs no special case for stopping.
+Two failure modes worth distinguishing in the UI — `409 conflict` means either the
+run already finished (the message says which status) or it is not executing in this
+process, and `404` means no such run at all.
 
 `POST` answers **immediately with the id** and runs in the background. That is the
 whole reason it is 202: a synchronous call could not hand you an id before the run
@@ -119,6 +132,34 @@ ceiling — and should be labelled as such, not shown as a finished reply.
 
 `/trace` returns the same records as a list, so one renderer serves both the live
 panel and the history view. It 404s if the run does not belong to that agent.
+
+`GET /admin/runs` is the global activity feed and each row carries `agent_slug`
+joined in. It exists rather than fanning out over `/agents/{id}/runs` because pages
+fetched per agent cannot be ordered against each other without fetching all of them.
+A run whose config has since been deleted still appears, with `agent_slug: null` —
+history outlives configuration, and dropping those rows would make spend vanish
+along with the agent.
+
+## Cost
+
+```
+GET /admin/usage?since=<iso8601>     200 → {since, runs, models, tools, caveat}
+```
+
+Three sources in one document, because no one of them answers the question alone:
+`runs` is Bloom's own rollup (counts by outcome, spend, `by_agent`), `models` is
+model spend per model from the runtime's tracker, and `tools` is tool-call counts
+per tool and per caller from the MCP layer.
+
+`tools` is **`null`, not zero**, when Bloom's MCP server is not mounted — zero would
+read as "nothing has called me" rather than "nobody could".
+
+Note this is deliberately *not* `/agent/usage`, which reports the same numbers behind
+`BLOOM_MCP_KEYS`. Aperture should never hold an MCP key: it would let one leaked
+token both read the ledger and spend against it.
+
+The response carries a `caveat` string, and it should be shown rather than dropped —
+see the accounting note below. Label totals "at least".
 
 ### One accounting caveat to surface
 

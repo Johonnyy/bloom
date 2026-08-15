@@ -1291,6 +1291,181 @@
         ]
       }
     },
+    "/admin/runs": {
+      "get": {
+        "description": "Every agent's runs in one list, newest first \u2014 the activity feed.\n\nOrdering is why this exists rather than a client fanning out over\n``/agents/{id}/runs``: pages fetched per agent cannot be interleaved correctly\nwithout fetching all of them.",
+        "operationId": "list_all_runs_admin_runs_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "running|succeeded|failed|\u2026",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "running|succeeded|failed|\u2026",
+              "title": "Status"
+            }
+          },
+          {
+            "description": "mcp | test_run",
+            "in": "query",
+            "name": "origin",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "mcp | test_run",
+              "title": "Origin"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "title": "Response List All Runs Admin Runs Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List All Runs",
+        "tags": [
+          "runs"
+        ]
+      }
+    },
+    "/admin/runs/{run_id}/cancel": {
+      "post": {
+        "description": "Ask an in-flight run to stop.\n\n202, not 200: cancellation is cooperative and asynchronous. This returns as soon\nas the request is delivered; the *outcome* arrives on the trace as\n``run_finished{status: 'cancelled'}``, the same terminal event every other ending\nproduces. A client that waits for the event rather than this response needs no\nspecial case for stopping.\n\nA run that has already finished is a 409 rather than a 404 \u2014 the run exists, it\nsimply cannot be cancelled, and telling those apart is what lets a UI say \"it\nalready finished\" instead of \"no such run\".",
+        "operationId": "cancel_admin_runs__run_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Cancel Admin Runs  Run Id  Cancel Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel",
+        "tags": [
+          "runs"
+        ]
+      }
+    },
     "/admin/runs/{run_id}/events": {
       "get": {
         "description": "Server-sent events for one run: replay, then tail, then stop.\n\n``Last-Event-ID`` wins over ``?after=`` because the browser sends it\nautomatically on reconnect, and an explicit query parameter left over from the\nfirst attempt would rewind the stream on every retry.",
@@ -1372,6 +1547,76 @@
         "summary": "Stream Events",
         "tags": [
           "runs"
+        ]
+      }
+    },
+    "/admin/usage": {
+      "get": {
+        "description": "Spend, tool calls and run counts in one document.\n\nEvery read is a separate SQLite connection over the same file, so they run in a\nworker thread together rather than three times over \u2014 see `app/db.py` on why the\nbusy timeout matters with this many writers and readers on one database.",
+        "operationId": "usage_admin_usage_get",
+        "parameters": [
+          {
+            "description": "ISO-8601 timestamp. Omit for all time.",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "ISO-8601 timestamp. Omit for all time.",
+              "title": "Since"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Usage Admin Usage Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Usage",
+        "tags": [
+          "usage"
         ]
       }
     },

@@ -29,6 +29,7 @@ from app.admin.agents import router as agents_router
 from app.admin.oauth_routes import public_router as oauth_public_router
 from app.admin.oauth_routes import router as oauth_router
 from app.admin.runs import router as runs_router
+from app.admin.usage import router as usage_router
 from app.config import Settings, get_settings
 from app.errors import install_error_handlers
 from app.health import router as health_router
@@ -104,6 +105,7 @@ install_error_handlers(app)
 app.include_router(health_router)
 app.include_router(agents_router)
 app.include_router(runs_router)
+app.include_router(usage_router)
 app.include_router(oauth_router)
 # Unauthenticated by design — the provider redirects a browser here, which carries
 # no bearer token. Its security is a single-use state row plus PKCE. See

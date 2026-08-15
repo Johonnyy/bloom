@@ -230,6 +230,39 @@ def build_runner(
     return runner, aclose
 
 
+# Every in-flight run, by id, so it can be cancelled from a request handler.
+#
+# Keyed by run id rather than held beside the background tasks in `app.admin.runs`
+# because an MCP-origin run has no background task — `run_task` awaits `execute_run`
+# inline in the request handler. Registering `current_task()` from inside the run
+# itself is the only place that sees both origins.
+_IN_FLIGHT: dict[str, asyncio.Task] = {}
+
+
+def cancel_run(run_id: str) -> bool:
+    """Ask an in-flight run to stop. False when it is not running here.
+
+    Cancellation is cooperative and asynchronous: this requests it and returns.
+    `execute_run`'s ``except CancelledError`` closes the row and emits the terminal
+    event, so the caller learns the outcome from the trace like any other ending
+    rather than from this return value.
+
+    "Not running here" is also the honest answer for a run owned by a different
+    process — a state this service cannot reach and should not pretend to.
+    """
+    task = _IN_FLIGHT.get(run_id)
+    if task is None or task.done():
+        return False
+    task.cancel()
+    logger.info("Cancellation requested for run %s", run_id)
+    return True
+
+
+def in_flight_ids() -> list[str]:
+    """Run ids this process is currently executing. Used by tests and diagnostics."""
+    return [rid for rid, task in _IN_FLIGHT.items() if not task.done()]
+
+
 async def execute_run(
     config: dict,
     prompt: str,
@@ -267,6 +300,12 @@ async def execute_run(
         depth=depth,
         caller=caller,
     )
+
+    # Registered after the row exists, so anything that can be cancelled can also be
+    # read back. Removed in the `finally` below, whatever the outcome.
+    current = asyncio.current_task()
+    if current is not None:
+        _IN_FLIGHT[run_id] = current
 
     writer = get_writer(store)
     recorder = RunRecorder(writer, run_id)
@@ -312,6 +351,7 @@ async def execute_run(
         error = f"{type(exc).__name__}: {exc}"
         logger.exception("Run %s failed", run_id)
     finally:
+        _IN_FLIGHT.pop(run_id, None)
         try:
             await aclose()
         except Exception:  # noqa: BLE001 — teardown must not mask the real outcome

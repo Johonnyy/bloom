@@ -633,6 +633,80 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def list_all_runs(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        status: str | None = None,
+        origin: str | None = None,
+    ) -> list[dict]:
+        """Runs across every agent, newest first, with the agent's slug joined in.
+
+        Not merely a convenience over calling :meth:`list_runs` per agent: N per-agent
+        pages cannot be *ordered* against each other without fetching all of them, so
+        an activity feed built that way is wrong as soon as there are two agents.
+
+        The slug is joined here rather than looked up client-side because a run whose
+        config has since been deleted still belongs in the history — LEFT JOIN leaves
+        the slug NULL rather than dropping the row.
+        """
+        where = []
+        params: list[Any] = []
+        if status:
+            where.append("r.status = ?")
+            params.append(status)
+        if origin:
+            where.append("r.origin = ?")
+            params.append(origin)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        params.extend([max(1, min(limit, 200)), max(0, offset)])
+
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT r.*, c.slug AS agent_slug FROM runs r "
+                "LEFT JOIN agent_configs c ON c.id = r.agent_config_id "
+                f"{clause} ORDER BY r.started_at DESC, r.id LIMIT ? OFFSET ?",  # noqa: S608
+                params,
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def runs_rollup(self, since: str | None = None) -> dict:
+        """What Bloom's own runs cost, which the library usage tables cannot say.
+
+        ``agent_runtime_usage`` knows model spend and ``agent_mcp_usage`` knows tool
+        calls, but neither knows what a *run* is — so neither can answer "how many
+        tasks were delegated, and how many of them failed".
+        """
+        clause = " WHERE started_at >= ?" if since else ""
+        params: tuple = (since,) if since else ()
+        with self._lock:
+            totals = self._conn.execute(
+                "SELECT COUNT(*) AS runs, "
+                "COALESCE(SUM(total_cost_usd), 0) AS cost_usd, "
+                "SUM(status = 'succeeded') AS succeeded, "
+                "SUM(status = 'failed') AS failed, "
+                "SUM(status = 'cancelled') AS cancelled, "
+                "SUM(status = 'running') AS running "
+                f"FROM runs{clause}",  # noqa: S608
+                params,
+            ).fetchone()
+            by_agent = self._conn.execute(
+                "SELECT COALESCE(c.slug, r.agent_config_id) AS agent, COUNT(*) AS runs, "
+                "COALESCE(SUM(r.total_cost_usd), 0) AS cost_usd "
+                "FROM runs r LEFT JOIN agent_configs c ON c.id = r.agent_config_id"
+                + (" WHERE r.started_at >= ?" if since else "")
+                + " GROUP BY agent ORDER BY cost_usd DESC LIMIT 50",
+                params,
+            ).fetchall()
+        out = dict(totals)
+        # COUNT returns 0 for an empty table but SUM(bool) returns NULL, and a JSON
+        # null where a client expects a number is a rendering bug at the far end.
+        for key in ("succeeded", "failed", "cancelled", "running"):
+            out[key] = int(out.get(key) or 0)
+        out["by_agent"] = [dict(r) for r in by_agent]
+        return out
+
     def append_event(
         self,
         run_id: str,

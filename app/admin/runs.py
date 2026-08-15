@@ -32,6 +32,7 @@ import asyncio
 import contextlib
 import json
 import logging
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Header, Query, Request
 from fastapi.responses import StreamingResponse
@@ -41,7 +42,7 @@ from app.admin.deps import require_admin
 from app.config import get_settings
 from app.db import get_store, new_id
 from app.errors import ApiError
-from app.runtime_service import execute_run
+from app.runtime_service import cancel_run, execute_run
 from app.trace import get_writer
 
 logger = logging.getLogger(__name__)
@@ -109,6 +110,57 @@ async def test_run(
     )
 
 
+@router.post("/runs/{run_id}/cancel", status_code=202)
+async def cancel(run_id: str) -> dict:
+    """Ask an in-flight run to stop.
+
+    202, not 200: cancellation is cooperative and asynchronous. This returns as soon
+    as the request is delivered; the *outcome* arrives on the trace as
+    ``run_finished{status: 'cancelled'}``, the same terminal event every other ending
+    produces. A client that waits for the event rather than this response needs no
+    special case for stopping.
+
+    A run that has already finished is a 409 rather than a 404 — the run exists, it
+    simply cannot be cancelled, and telling those apart is what lets a UI say "it
+    already finished" instead of "no such run".
+    """
+    run = await asyncio.to_thread(get_store().get_run, run_id)
+    if run is None:
+        raise ApiError(404, "not_found", f"No run {run_id!r}.")
+    if run["status"] != "running":
+        raise ApiError(409, "conflict", f"Run {run_id!r} already finished ({run['status']}).")
+    if not cancel_run(run_id):
+        # The row says running but this process is not the one running it: another
+        # worker owns it, or it was abandoned by a process that died without the
+        # startup sweep having reached it yet.
+        raise ApiError(
+            409,
+            "conflict",
+            "This run is not executing in this process, so it cannot be cancelled "
+            "here. It will be closed out as abandoned on the next restart.",
+        )
+    logger.info("Cancel requested for run %s", run_id)
+    return {"run_id": run_id, "status": "cancelling"}
+
+
+@router.get("/runs")
+async def list_all_runs(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    status: str | None = Query(default=None, description="running|succeeded|failed|…"),
+    origin: str | None = Query(default=None, description="mcp | test_run"),
+) -> list[dict]:
+    """Every agent's runs in one list, newest first — the activity feed.
+
+    Ordering is why this exists rather than a client fanning out over
+    ``/agents/{id}/runs``: pages fetched per agent cannot be interleaved correctly
+    without fetching all of them.
+    """
+    return await asyncio.to_thread(
+        get_store().list_all_runs, limit=limit, offset=offset, status=status, origin=origin
+    )
+
+
 @router.get("/agents/{config_id}/runs")
 async def list_runs(
     config_id: str,
@@ -135,6 +187,31 @@ async def run_trace(
         raise ApiError(404, "not_found", f"No run {run_id!r} for agent {config_id!r}.")
     events = await asyncio.to_thread(get_store().events_after, run_id, after, limit=limit)
     return {"run": run, "events": events}
+
+
+# How long after a run's row is closed the terminal event is still presumed to be
+# in flight on the writer's queue. Comfortably longer than a queue drain, short
+# enough that a genuinely lost event does not hold a stream open.
+_TERMINAL_GRACE_S = 3.0
+
+
+def _settled(run: dict) -> bool:
+    """Whether a finished run's terminal event has clearly had its chance to land.
+
+    An unparseable or missing ``finished_at`` counts as settled: this gates a safety
+    net, and a safety net that fails closed on a malformed timestamp would hold a
+    stream open forever.
+    """
+    raw = run.get("finished_at")
+    if not raw:
+        return True
+    try:
+        finished = datetime.fromisoformat(raw)
+    except ValueError:
+        return True
+    if finished.tzinfo is None:
+        finished = finished.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - finished).total_seconds() >= _TERMINAL_GRACE_S
 
 
 def _sse(event_id: int | None, kind: str, data: dict) -> str:
@@ -180,11 +257,21 @@ async def stream_events(
                         return
 
                 # Already over before this reader arrived and no terminal event
-                # exists — an abandoned run from a previous process, or one the
-                # startup sweep has not reached. End rather than tail forever.
+                # exists — an abandoned run from a previous process, or one whose
+                # event was dropped under queue pressure. End rather than tail
+                # forever.
+                #
+                # Gated on how long ago it finished, because the run row and the
+                # terminal event are NOT written together: `finish_run` writes the
+                # row synchronously while `run_finished` is only queued for the
+                # background writer. Without the grace period this fires in that
+                # window, synthesizes a terminal event without the real one's cost
+                # and stopped_by, and closes the stream just before the real event
+                # arrives — so the client sees a worse answer *because* it was
+                # watching closely.
                 if not rows:
                     current = await asyncio.to_thread(store.get_run, run_id)
-                    if current and current["status"] != "running":
+                    if current and current["status"] != "running" and _settled(current):
                         yield _sse(None, "run_finished", {"status": current["status"]})
                         return
 
