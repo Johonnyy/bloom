@@ -61,14 +61,13 @@ def test_a_config_survives_a_full_create_read_update_delete_round_trip(client):
             "name": "Spotify DJ",
             "system_prompt": "You pick music.",
             "model_tier": "balanced",
-            "mcp_servers": ["amber"],
         },
     )
     assert created.status_code == 201, created.text
     body = created.json()
     assert body["slug"] == "spotify-dj"
-    assert body["mcp_servers"] == ["amber"]
-    assert body["oauth_connections"] == []
+    # Nothing about what it can reach: connections are attached afterwards.
+    assert body["connections"] == []
     config_id = body["id"]
 
     fetched = client.get(f"/admin/agents/{config_id}", headers=AUTH)
@@ -88,6 +87,28 @@ def test_a_config_survives_a_full_create_read_update_delete_round_trip(client):
 
     assert client.delete(f"/admin/agents/{config_id}", headers=AUTH).status_code == 204
     assert client.get(f"/admin/agents/{config_id}", headers=AUTH).status_code == 404
+
+
+def test_creating_an_agent_asks_for_nothing_but_a_slug(client):
+    """The whole complaint this change answers: it used to ask about servers first."""
+    created = client.post("/admin/agents", headers=AUTH, json={"slug": "bare"})
+    assert created.status_code == 201, created.text
+    assert created.json()["connections"] == []
+
+
+def test_a_field_this_version_does_not_know_is_refused_rather_than_ignored(client):
+    """Pydantic's default is to drop unknown fields.
+
+    On a clean API break that means a stale client sending `mcp_servers` would get
+    a 201 and an agent that silently reaches nothing — the failure would surface as
+    an agent quietly having no tools. A 422 naming the field is the cheapest
+    possible compatibility signal.
+    """
+    refused = client.post(
+        "/admin/agents", headers=AUTH, json={"slug": "stale", "mcp_servers": ["amber"]}
+    )
+    assert refused.status_code == 422
+    assert "mcp_servers" in refused.json()["message"]
 
 
 def test_a_duplicate_slug_is_a_conflict_not_a_second_row(client):

@@ -4,10 +4,13 @@ The place you **define an agent** instead of building an app for it.
 
 Amber should be able to hand "put on something mellow" to a music agent without
 carrying a Spotify integration herself. Bloom is where that agent is defined — a
-system prompt, a model tier, a set of peer MCP servers, a connected account — and
-where it runs when someone delegates to it. Adding a capability to the ecosystem
-becomes a row in a table rather than a repo, a container, a subdomain and a
-deploy.
+system prompt, a model tier, and the **connections** it may act through — and where
+it runs when someone delegates to it. Adding a capability to the ecosystem becomes a
+row in a table rather than a repo, a container, a subdomain and a deploy.
+
+A connection is an OAuth account, an API key, or an MCP server, and it lives in a
+global library: approve Spotify once and any agent can attach it. Creating an agent
+asks for a slug and nothing else.
 
 It is the service the ecosystem docs have been calling `agent-spawner`.
 
@@ -72,6 +75,8 @@ All of it, with 75 tests and no network needed to run them.
 - [x] `/mcp` — `run_task`, `list_agents`, the `bloom://agents` resource
 - [x] Execution: `runtime_service.build_runner`, ceilings, broker teardown
 - [x] Run trace: `run_events`, live SSE with `Last-Event-ID` resumption, test-run
+- [x] Connections: one library, three kinds (`oauth` / `api_key` / `mcp`), shared
+      across agents, with a `/test` probe that actually contacts the far end
 - [x] OAuth: provider manifests, Fernet-at-rest, PKCE, the `aperture://` handoff
 - [x] Proactive token refresh, plus a call-time check the sweep cannot replace
 - [x] [docs/aperture-integration.md](docs/aperture-integration.md) + `docs/openapi.json`
@@ -82,9 +87,10 @@ a `bloom/docker-compose.prod.yml`, an `apps.bloom` stanza in `secrets.yaml`, and
 
 ## Adding a provider
 
-A file, not code. Copy [app/providers/spotify.toml](app/providers/spotify.toml),
-name the two environment variables holding its client credentials, and declare one
-`[[operations]]` block per thing an agent should be able to do. Each becomes a tool
+A file, not code. Copy [app/providers/spotify.toml](app/providers/spotify.toml) (an
+OAuth provider) or [app/providers/github.toml](app/providers/github.toml) (which
+also accepts a pasted key), say which kinds of credential it takes with `auth`, and
+declare one `[[operations]]` block per thing an agent should be able to do. Each becomes a tool
 named `<provider>_<operation>` whose `description` is the only thing the model sees
 — so write it for the model, naming the fields it should read out of the response.
 

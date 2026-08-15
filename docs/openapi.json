@@ -2,6 +2,7 @@
   "components": {
     "schemas": {
       "AgentConfigIn": {
+        "additionalProperties": false,
         "description": "Everything a caller may set when creating a config.",
         "properties": {
           "max_cost_usd": {
@@ -28,13 +29,6 @@
               }
             ],
             "title": "Max Steps"
-          },
-          "mcp_servers": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Mcp Servers",
-            "type": "array"
           },
           "model_tier": {
             "default": "balanced",
@@ -66,6 +60,13 @@
       },
       "AgentConfigOut": {
         "properties": {
+          "connections": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Connections",
+            "type": "array"
+          },
           "created_at": {
             "title": "Created At",
             "type": "string"
@@ -96,13 +97,6 @@
             ],
             "title": "Max Steps"
           },
-          "mcp_servers": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Mcp Servers",
-            "type": "array"
-          },
           "model_tier": {
             "title": "Model Tier",
             "type": "string"
@@ -110,13 +104,6 @@
           "name": {
             "title": "Name",
             "type": "string"
-          },
-          "oauth_connections": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Oauth Connections",
-            "type": "array"
           },
           "slug": {
             "title": "Slug",
@@ -137,8 +124,7 @@
           "name",
           "system_prompt",
           "model_tier",
-          "mcp_servers",
-          "oauth_connections",
+          "connections",
           "max_steps",
           "max_cost_usd",
           "created_at",
@@ -148,6 +134,7 @@
         "type": "object"
       },
       "AgentConfigPatch": {
+        "additionalProperties": false,
         "description": "A partial update. Every field optional; ``None`` means \"leave alone\".",
         "properties": {
           "max_cost_usd": {
@@ -174,20 +161,6 @@
               }
             ],
             "title": "Max Steps"
-          },
-          "mcp_servers": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Mcp Servers"
           },
           "model_tier": {
             "anyOf": [
@@ -238,6 +211,307 @@
         "title": "AgentConfigPatch",
         "type": "object"
       },
+      "AttachIn": {
+        "additionalProperties": false,
+        "properties": {
+          "connection_id": {
+            "title": "Connection Id",
+            "type": "string"
+          },
+          "position": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Broker priority. Defaults to the end, so attaching never reorders what an agent already had.",
+            "title": "Position"
+          }
+        },
+        "required": [
+          "connection_id"
+        ],
+        "title": "AttachIn",
+        "type": "object"
+      },
+      "ConnectionIn": {
+        "additionalProperties": false,
+        "description": "What creating a connection takes. Unknown fields are refused, not ignored.",
+        "properties": {
+          "attach_to": {
+            "description": "Agent ids to attach this to, in the same transaction as the create.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Attach To",
+            "type": "array"
+          },
+          "client_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client Id"
+          },
+          "client_secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client Secret"
+          },
+          "config": {
+            "additionalProperties": true,
+            "description": "Non-secret settings. For mcp: {'url': ...}.",
+            "title": "Config",
+            "type": "object"
+          },
+          "kind": {
+            "description": "oauth | api_key | mcp",
+            "title": "Kind",
+            "type": "string"
+          },
+          "label": {
+            "default": "",
+            "title": "Label",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Stable handle. Defaults to the provider name; required for mcp, where it is also the tool namespace.",
+            "title": "Name"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Manifest name. Required for oauth/api_key, absent for mcp.",
+            "title": "Provider"
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Scopes",
+            "type": "array"
+          },
+          "secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "An API key, or a peer's bearer token.",
+            "title": "Secret"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "ConnectionIn",
+        "type": "object"
+      },
+      "ConnectionOut": {
+        "properties": {
+          "agent_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Agent Ids",
+            "type": "array"
+          },
+          "config": {
+            "additionalProperties": true,
+            "title": "Config",
+            "type": "object"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "has_client_secret": {
+            "title": "Has Client Secret",
+            "type": "boolean"
+          },
+          "has_secret": {
+            "title": "Has Secret",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "last_used_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Used At"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Scopes",
+            "type": "array"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "tools": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tools",
+            "type": "array"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "provider",
+          "name",
+          "label",
+          "status",
+          "config",
+          "has_secret",
+          "has_client_secret",
+          "scopes",
+          "expires_at",
+          "last_used_at",
+          "created_at",
+          "updated_at",
+          "agent_ids",
+          "tools"
+        ],
+        "title": "ConnectionOut",
+        "type": "object"
+      },
+      "ConnectionPatch": {
+        "additionalProperties": false,
+        "description": "Editable, non-secret fields.\n\n``kind`` and ``provider`` are absent deliberately: both would invalidate the\nstored secret. So is every secret \u2014 a PATCH carrying one is a 422 rather than a\nplaintext key in a request log, and rotation goes through ``POST /{id}/secret``.",
+        "properties": {
+          "config": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Config"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "scopes": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scopes"
+          }
+        },
+        "title": "ConnectionPatch",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -251,7 +525,80 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "ProbeOut": {
+        "description": "What a test told us, and which test it was.\n\n``checked`` matters: \"the credential decrypts\" and \"the provider accepted it\"\nare very different claims, and reporting the weaker one as the stronger is how\na green tick comes to mean nothing.",
+        "properties": {
+          "checked": {
+            "title": "Checked",
+            "type": "string"
+          },
+          "detail": {
+            "default": "",
+            "title": "Detail",
+            "type": "string"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "tools": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tools",
+            "type": "array"
+          }
+        },
+        "required": [
+          "ok",
+          "checked"
+        ],
+        "title": "ProbeOut",
+        "type": "object"
+      },
+      "SecretIn": {
+        "additionalProperties": false,
+        "description": "Paste or rotate one of a connection's two secrets.\n\nThey rotate on completely different schedules \u2014 the user's credential when it\nis reissued, the app's when you roll it in the provider's console \u2014 so setting\none leaves the other alone.",
+        "properties": {
+          "client_secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client Secret"
+          },
+          "secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Secret"
+          }
+        },
+        "title": "SecretIn",
+        "type": "object"
+      },
       "StartIn": {
+        "additionalProperties": false,
         "properties": {
           "scopes": {
             "anyOf": [
@@ -452,7 +799,7 @@
         ]
       },
       "post": {
-        "description": "Define a new agent.",
+        "description": "Define a new agent. Connections are attached afterwards, not here.",
         "operationId": "create_agent_admin_agents_post",
         "parameters": [
           {
@@ -512,7 +859,7 @@
     },
     "/admin/agents/{config_id}": {
       "delete": {
-        "description": "Delete a config, its bindings, and any OAuth connection it owns.\n\nConnections marked shared (no owning config) survive deliberately \u2014 see\n`app.db.Store.delete_config`.",
+        "description": "Delete a config and its attachments. **Its connections survive.**\n\nA connection is a library entry, not a possession of whichever agent created\nit: deleting an agent must not revoke a credential another agent is using, or\none you would only have to authorise again. This is the exact inverse of what\nthis route used to do \u2014 see `app.db.Store.delete_config`.",
         "operationId": "delete_agent_admin_agents__config_id__delete",
         "parameters": [
           {
@@ -684,10 +1031,10 @@
         ]
       }
     },
-    "/admin/agents/{config_id}/oauth": {
+    "/admin/agents/{config_id}/connections": {
       "get": {
-        "description": "This config's connections: provider, state, scopes, last used. No tokens.",
-        "operationId": "connection_status_admin_agents__config_id__oauth_get",
+        "description": "This agent's connections, in broker order.",
+        "operationId": "agent_connections_admin_agents__config_id__connections_get",
         "parameters": [
           {
             "in": "path",
@@ -721,10 +1068,9 @@
               "application/json": {
                 "schema": {
                   "items": {
-                    "additionalProperties": true,
-                    "type": "object"
+                    "$ref": "#/components/schemas/ConnectionOut"
                   },
-                  "title": "Response Connection Status Admin Agents  Config Id  Oauth Get",
+                  "title": "Response Agent Connections Admin Agents  Config Id  Connections Get",
                   "type": "array"
                 }
               }
@@ -742,16 +1088,87 @@
             "description": "Validation Error"
           }
         },
-        "summary": "Connection Status",
+        "summary": "Agent Connections",
         "tags": [
-          "oauth"
+          "connections"
+        ]
+      },
+      "post": {
+        "description": "Attach an existing library connection to an agent.\n\nRefused with a 409 when the agent already has a connection for the same\nprovider: provider tools are named ``<provider>_<operation>``, checked when the\nmanifest loads, so two would collide on tool name and the broker would silently\nkeep whichever came first.",
+        "operationId": "attach_connection_admin_agents__config_id__connections_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "config_id",
+            "required": true,
+            "schema": {
+              "title": "Config Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AttachIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ConnectionOut"
+                  },
+                  "title": "Response Attach Connection Admin Agents  Config Id  Connections Post",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Attach Connection",
+        "tags": [
+          "connections"
         ]
       }
     },
-    "/admin/agents/{config_id}/oauth/{provider_name}": {
+    "/admin/agents/{config_id}/connections/{connection_id}": {
       "delete": {
-        "description": "Revoke a connection and zero its tokens.\n\nThe row survives, marked ``revoked``, so the agent's page can still show\n\"Spotify \u2014 disconnected\" rather than the provider silently disappearing.",
-        "operationId": "disconnect_admin_agents__config_id__oauth__provider_name__delete",
+        "description": "Unbind one connection from one agent. The connection itself survives.",
+        "operationId": "detach_connection_admin_agents__config_id__connections__connection_id__delete",
         "parameters": [
           {
             "in": "path",
@@ -764,10 +1181,10 @@
           },
           {
             "in": "path",
-            "name": "provider_name",
+            "name": "connection_id",
             "required": true,
             "schema": {
-              "title": "Provider Name",
+              "title": "Connection Id",
               "type": "string"
             }
           },
@@ -803,94 +1220,9 @@
             "description": "Validation Error"
           }
         },
-        "summary": "Disconnect",
+        "summary": "Detach Connection",
         "tags": [
-          "oauth"
-        ]
-      }
-    },
-    "/admin/agents/{config_id}/oauth/{provider_name}/start": {
-      "post": {
-        "description": "Begin a connection. Returns the URL Aperture should open in a browser.",
-        "operationId": "start_connect_admin_agents__config_id__oauth__provider_name__start_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "config_id",
-            "required": true,
-            "schema": {
-              "title": "Config Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "provider_name",
-            "required": true,
-            "schema": {
-              "title": "Provider Name",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "anyOf": [
-                  {
-                    "$ref": "#/components/schemas/StartIn"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "title": "Body"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StartOut"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Start Connect",
-        "tags": [
-          "oauth"
+          "connections"
         ]
       }
     },
@@ -1145,11 +1477,418 @@
         ]
       }
     },
-    "/admin/oauth/providers": {
+    "/admin/connections": {
       "get": {
-        "description": "Every provider Bloom has a manifest for, and whether it can be connected.\n\n``configured`` is the difference between \"a manifest ships in the image\" and\n\"client credentials exist in this deployment\" \u2014 which is what lets Aperture\ngrey out a Connect button with a reason rather than failing at the redirect.",
-        "operationId": "list_providers_admin_oauth_providers_get",
+        "description": "The whole library, newest first.",
+        "operationId": "list_connections_admin_connections_get",
         "parameters": [
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "provider",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Provider"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ConnectionOut"
+                  },
+                  "title": "Response List Connections Admin Connections Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Connections",
+        "tags": [
+          "connections"
+        ]
+      },
+      "post": {
+        "description": "Create a connection, optionally attaching it to agents in one transaction.\n\n``attach_to`` is why this is one call rather than two: \"add a connection to this\nagent\" is a single intent, and splitting it invents a half-done state \u2014 a\nconnection that exists but is attached to nothing \u2014 that a client would have to\ndetect and recover from. An unknown agent id creates nothing at all.",
+        "operationId": "create_connection_admin_connections_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Connection",
+        "tags": [
+          "connections"
+        ]
+      }
+    },
+    "/admin/connections/kinds": {
+      "get": {
+        "description": "The kinds and providers this build offers, so a UI never ships a stale list.\n\n``available`` carries the reason a kind cannot be used *before* the user picks\nit, rather than as a 503 at the moment the browser was meant to open.\n\n``has_deployment_default`` says whether this box carries client credentials for\na provider. It is a hint that lets the create form prefill \u2014 not a gate: a\nconnection may bring its own, which is what makes connecting an account\nsomething a user can do rather than a deployment operation.",
+        "operationId": "connection_kinds_admin_connections_kinds_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Connection Kinds Admin Connections Kinds Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Connection Kinds",
+        "tags": [
+          "connections"
+        ]
+      }
+    },
+    "/admin/connections/{connection_id}": {
+      "delete": {
+        "description": "Delete a connection. A 409 when it is still attached, unless forced.\n\nThe library model's one sharp edge: a shared connection deleted without warning\nsilently strips capability from agents nobody was looking at. So the refusal\nnames them, and a UI can render it as a confirmation rather than an error.",
+        "operationId": "delete_connection_admin_connections__connection_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Detach from every agent and delete.",
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Detach from every agent and delete.",
+              "title": "Force",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Connection",
+        "tags": [
+          "connections"
+        ]
+      },
+      "get": {
+        "operationId": "get_connection_admin_connections__connection_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Connection",
+        "tags": [
+          "connections"
+        ]
+      },
+      "patch": {
+        "operationId": "update_connection_admin_connections__connection_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Connection",
+        "tags": [
+          "connections"
+        ]
+      }
+    },
+    "/admin/connections/{connection_id}/agents": {
+      "get": {
+        "description": "Which agents use this connection \u2014 what makes deleting one an informed choice.",
+        "operationId": "connection_agents_admin_connections__connection_id__agents_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
           {
             "in": "header",
             "name": "authorization",
@@ -1176,7 +1915,7 @@
                     "additionalProperties": true,
                     "type": "object"
                   },
-                  "title": "Response List Providers Admin Oauth Providers Get",
+                  "title": "Response Connection Agents Admin Connections  Connection Id  Agents Get",
                   "type": "array"
                 }
               }
@@ -1194,15 +1933,278 @@
             "description": "Validation Error"
           }
         },
-        "summary": "List Providers",
+        "summary": "Connection Agents",
         "tags": [
-          "oauth"
+          "connections"
+        ]
+      }
+    },
+    "/admin/connections/{connection_id}/oauth/start": {
+      "post": {
+        "description": "Begin (or repeat) the browser flow for one connection.\n\nRepeating it on a live connection is allowed and changes nothing until the\ncallback succeeds: opening the authorize page and abandoning the tab is a thing\npeople do, and it must not break a connection that already works.",
+        "operationId": "start_oauth_admin_connections__connection_id__oauth_start_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/StartIn"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Oauth",
+        "tags": [
+          "connections"
+        ]
+      }
+    },
+    "/admin/connections/{connection_id}/revoke": {
+      "post": {
+        "description": "Zero the user's credential and mark the connection revoked.\n\nThe row survives so a UI can still show \"Spotify \u2014 disconnected\" instead of the\nprovider silently vanishing, and the *client* secret survives with it: the app\nregistration is still yours, and clearing it would mean re-entering it to\nreconnect something you only disconnected.",
+        "operationId": "revoke_connection_admin_connections__connection_id__revoke_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke Connection",
+        "tags": [
+          "connections"
+        ]
+      }
+    },
+    "/admin/connections/{connection_id}/secret": {
+      "post": {
+        "description": "Paste or rotate a secret. Never a PATCH, so a secret cannot ride an edit.",
+        "operationId": "set_secret_admin_connections__connection_id__secret_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecretIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Secret",
+        "tags": [
+          "connections"
+        ]
+      }
+    },
+    "/admin/connections/{connection_id}/test": {
+      "post": {
+        "description": "Prove the connection actually works, rather than merely being stored.\n\nThis is what makes \"paste a URL and a token\" trustworthy: a peer is contacted\nand its real tool list comes back, and a credential makes one cheap read-only\nrequest. Storing a secret proves only that it decrypts.\n\nNever echoes a credential \u2014 not in the detail string, not in the tool list.",
+        "operationId": "test_connection_admin_connections__connection_id__test_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProbeOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Test Connection",
+        "tags": [
+          "connections"
         ]
       }
     },
     "/admin/oauth/{provider_name}/callback": {
       "get": {
-        "description": "Where the provider sends the browser. **Deliberately unauthenticated.**\n\nAlways answers with a page a human can read, never a JSON error: whatever went\nwrong, the person is sitting in front of a browser tab and needs a sentence,\nnot an envelope.",
+        "description": "Where the provider sends the browser. **Deliberately unauthenticated.**",
         "operationId": "callback_admin_oauth__provider_name__callback_get",
         "parameters": [
           {

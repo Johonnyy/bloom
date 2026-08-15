@@ -62,11 +62,15 @@ def install_error_handlers(app: FastAPI) -> None:
     async def _on_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
         # Flattened to one line: a GUI shows this in a toast, and pydantic's nested
         # error list is unreadable there. The full detail is still in the log.
-        detail = "; ".join(
-            f"{'.'.join(str(p) for p in err.get('loc', ()) if p != 'body')}: {err.get('msg')}"
-            for err in exc.errors()
-        )
-        return error_response(422, "unprocessable", detail or "invalid request body")
+        parts = []
+        for err in exc.errors():
+            field = ".".join(str(p) for p in err.get("loc", ()) if p != "body")
+            # A whole-model validator has an empty location, and prefixing its
+            # message with a bare ": " reads like a missing field name rather than a
+            # rule about the body as a whole.
+            message = str(err.get("msg", "")).removeprefix("Value error, ")
+            parts.append(f"{field}: {message}" if field else message)
+        return error_response(422, "unprocessable", "; ".join(parts) or "invalid request body")
 
     @app.exception_handler(StarletteHTTPException)
     async def _on_http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:

@@ -10,6 +10,10 @@ dependencies = [
     # embedded libraries are configured by injection rather than their own env.
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
+    # Imported directly, not merely pulled in by pydantic-settings: app/config.py
+    # calls load_dotenv() so that the variables a provider manifest names — which
+    # are not fields on Settings and so are never exported by it — resolve from
+    # `.env` under a bare `uvicorn` and not only under Docker.
     "python-dotenv>=1.0",
     # The convention layer for Bloom's own MCP server — the execution surface
     # other agents delegate through: bearer auth, the conversation-depth guard,

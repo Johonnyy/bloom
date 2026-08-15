@@ -130,10 +130,10 @@ migrating core services to GitHub Actions webhook deploys once stable.
 
 The place you **define an agent** instead of building an app for it.
 
-An agent here is a row: a system prompt, a model tier, a set of peer MCP servers,
-and any connected accounts it needs. Amber delegates a task to one over MCP;
-Aperture creates and edits them over REST. Adding "Bloom can control Spotify" is a
-config plus a TOML manifest, not a repo, a container, a subdomain and a deploy.
+An agent here is a row: a system prompt, a model tier, and the **connections** it
+may act through. Amber delegates a task to one over MCP; Aperture creates and edits
+them over REST. Adding "Bloom can control Spotify" is a config plus a TOML manifest,
+not a repo, a container, a subdomain and a deploy.
 
 It is **not** a general task queue, not a router that guesses which agent to use
 (the caller names one — auto-routing is a v2 idea worth having only once there are
@@ -210,6 +210,55 @@ queue drops events rather than stalling the run it describes.
 emitted on every path out including cancellation, and the startup sweep writes one
 for every run a dead process left `running`.
 
+### Connections — one vocabulary for what an agent can reach
+
+There used to be two, and both were half-built. An agent's reach was an
+``mcp_servers`` list of bare peer names on the config row *plus* a set of OAuth
+connections owned by that config — so a peer could not carry a credential, an API
+key was not expressible at all, and a connection could not be shared even though the
+schema had a binding table and a ``shared`` flag: the exchange stamped an owner
+every time, so nothing could ever set it.
+
+A **connection** is now a first-class row in a global library, with a `kind` of
+`oauth`, `api_key` or `mcp`. Creating one from an agent's page attaches it; the row
+belongs to nobody, any other agent can attach the same one, and **deleting an agent
+deletes none of them** — the exact inversion of what `delete_config` used to do, and
+the property `tests/test_connections.py` guards first.
+
+Three things this bought, none of which needed new machinery:
+
+* **`api_key` reuses the provider manifests.** `register_operations` already built
+  tools that ask a resolver for a credential at call time and never close over one;
+  only where the secret comes from differs. A manifest says which it accepts with
+  `auth = ["oauth", "api_key"]`, and `[api_key]` says where the key goes.
+* **A peer is just a connection with a URL.** `MCPClient` takes a plain
+  `{name: {base_url, token}}` resolver mapping, so `_peer_resolver` bypasses
+  `agent_mcp.registry` entirely. `_known_peers` is gone; discovery survives only as
+  prefill in `/admin/connections/kinds`. A connection's `name` is the tool namespace
+  (`<name>__<tool>`), which is why it is validated like a manifest's provider name.
+* **Provider client credentials moved onto the connection.** They were process
+  environment, which made connecting Spotify a deployment operation — write
+  `secrets.yaml` over SSH, reconcile, restart the container — and required a whole
+  panel in Aperture's *Servers* tab to do it from a GUI. `client_id` lives in the
+  connection's config and `client_secret` in its own encrypted column;
+  `registry.client_for` resolves connection-first, environment-second, so an
+  existing deployment keeps working and a shared registration is still possible.
+  That panel, its `dynamic_keys` manifest stanza and the `fillCredentials` SSH
+  action are all deleted.
+
+The tradeoff worth knowing: an app client secret now sits in `bloom.db`, under the
+same Fernet key that already protects the user's access *and refresh* tokens for
+that account. The refresh token is the more dangerous of the two, so this is not a
+new class of secret in the file.
+
+Note the asymmetry in `build_runner`: the credential broker is gated on
+`connections_enabled`, `_peer_resolver` is not. A tokenless peer on a trusted
+network needs no encryption key — there is no secret to store badly.
+
+**Broker order is still priority order**, and still load-bearing: credential tools
+first, peers last, so a peer can never shadow a tool carrying the user's own account
+access. `tests/test_peers.py` asserts it explicitly.
+
 ### Credentials — `app/providers/`, `app/credentials.py`, `app/crypto.py`
 
 A provider is a TOML manifest declaring operations; each becomes a tool named
@@ -223,8 +272,10 @@ is replayed into the next request, is logged at INFO by the runtime, and is
 persisted in Bloom's trace — a credential must never be settable as one.
 
 Tokens are **not** captured in closures either: each tool holds a *connection id*
-and asks `CredentialResolver` at call time, so a token expiring mid-run is refreshed
-rather than fatal. Refresh is serialised per connection with a re-read inside the
+and asks `CredentialResolver.credential()` at call time — which returns a
+`Credential` with the secret already placed in the header or query parameter that
+provider wants, so nothing downstream branches on where it came from. A token
+expiring mid-run is refreshed rather than fatal. Refresh is serialised per connection with a re-read inside the
 lock, because for a provider with rotating refresh tokens losing that race
 permanently breaks the grant. That is correct single-process only; multi-worker
 would need a DB row claim.
@@ -235,11 +286,16 @@ already stored.
 
 ### OAuth
 
+The flow belongs to a **connection**, not to whichever agent started it — that is
+what makes one approval attachable to a second agent. `oauth_states.connection_id`
+carries it, and `status='pending'` finally means something (it was in the enum from
+day one and nothing ever wrote it).
+
 Bloom hosts the callback because Aperture, a desktop app, has no public URL. The
 callback is the **one unauthenticated route** in the service and cannot be
 otherwise: a provider redirects a browser, which carries no bearer. Its security is
 a single-use `state` row plus PKCE. It lives on its own router
-(`app/admin/oauth_routes.py: public_router`) — do not add a second route there.
+(`app/admin/oauth_callback.py: public_router`) — do not add a second route there.
 
 The completion page fires `aperture://oauth-complete?provider=…&status=…` *and*
 renders readable text, because Aperture does not register that scheme yet. Both, so
@@ -259,7 +315,7 @@ python -m venv .venv && .venv/Scripts/activate    # .venv/bin/activate on POSIX
 pip install -e ".[dev]"
 cp .env.example .env                              # BLOOM_ADMIN_KEYS at minimum
 
-pytest -q                                         # 75 tests, no network, nothing to start
+pytest -q                                         # 173 tests, no network, nothing to start
 ruff check . && ruff format --check .
 make openapi                                      # docs/openapi.json; CI fails if stale
 uvicorn app.main:app --reload --port 8010
@@ -269,7 +325,8 @@ Key modules: [app/config.py](app/config.py) (every knob),
 [app/db.py](app/db.py) (schema + store), [app/runtime_service.py](app/runtime_service.py)
 (config → runner → run), [app/trace.py](app/trace.py) (the trace seams),
 [app/mcp.py](app/mcp.py) (`run_task`), [app/providers/registry.py](app/providers/registry.py)
-(manifests → tools), [app/credentials.py](app/credentials.py) (live tokens),
+(manifests → tools), [app/admin/connections.py](app/admin/connections.py) (the
+library), [app/credentials.py](app/credentials.py) (live credentials),
 [docs/aperture-integration.md](docs/aperture-integration.md) (the GUI contract).
 
 ## Not done

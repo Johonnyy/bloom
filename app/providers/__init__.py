@@ -5,18 +5,26 @@ format and the validation it is held to, and `spotify.toml` for a worked example
 """
 
 from app.providers.registry import (
+    ApiKeySpec,
+    ClientCredentials,
     ManifestError,
     Operation,
+    Probe,
     Provider,
+    client_for,
     get_provider,
     providers,
     register_operations,
 )
 
 __all__ = [
+    "ApiKeySpec",
+    "ClientCredentials",
     "ManifestError",
     "Operation",
+    "Probe",
     "Provider",
+    "client_for",
     "get_provider",
     "providers",
     "register_operations",

@@ -50,8 +50,7 @@ DELETE /admin/agents/{id}                        204
   "name": "Spotify DJ",
   "system_prompt": "You pick music.",
   "model_tier": "balanced",        // cheap | balanced | strong, or a literal vendor/model
-  "mcp_servers": ["amber"],        // peer names, resolved via the sync store
-  "oauth_connections": ["…"],      // connection ids, from the binding table
+  "connections": ["…"],            // attached connection ids, in broker order
   "max_steps": null,               // null = use the service ceiling
   "max_cost_usd": null,
   "created_at": "…", "updated_at": "…"
@@ -62,10 +61,10 @@ Two validation behaviours worth building UI around:
 
 - **`model_tier` is rejected at edit time** (422) if it is neither a known tier nor
   a literal `vendor/model`. Show the message; it names what was wrong.
-- **`mcp_servers` is *not* validated.** Naming a peer that has not registered yet is
-  allowed — a config may legitimately precede its peer — and the run silently skips
-  unresolvable ones. If Aperture wants to warn, cross-reference the sync store; do
-  not treat it as an error.
+- **Creation asks nothing about what the agent can reach.** `mcp_servers` is gone;
+  capability is attached afterwards as connections. An unknown field is **refused**
+  (`422` naming it) rather than ignored, so a stale client sending `mcp_servers`
+  hears about it instead of silently creating an agent that reaches nothing.
 - A duplicate `slug` is `409 conflict`.
 - **Ceilings clamp, they never raise.** A config may lower `max_steps` /
   `max_cost_usd` below the service values; a higher number is silently clamped
@@ -168,63 +167,99 @@ that it does not report. So a stopped run's `cost_usd` **under-reports by exactl
 one model call**. This is upstream behaviour in `agent-runtime`, not a Bloom bug;
 if the number is presented as authoritative, say "at least".
 
-## Connected accounts
+## Connections
 
 ```
-GET    /admin/oauth/providers                                200 → provider[]
-GET    /admin/agents/{id}/oauth                              200 → connection[]
-POST   /admin/agents/{id}/oauth/{provider}/start  {"scopes"?} 200 → {authorize_url, state, expires_at, scopes, redirect_uri}
-DELETE /admin/agents/{id}/oauth/{provider}                   204
-GET    /admin/oauth/{provider}/callback                      *** no auth — the browser lands here ***
+GET    /admin/connections/kinds                        200 → what this build offers
+POST   /admin/connections                              201 → Connection
+GET    /admin/connections?kind=&provider=&status=      200 → Connection[]
+GET    /admin/connections/{id}                         200 → Connection
+PATCH  /admin/connections/{id}                         200 → Connection
+DELETE /admin/connections/{id}?force=                  204 · 409 when attached
+GET    /admin/connections/{id}/agents                  200 → {id, slug, name}[]
+POST   /admin/connections/{id}/secret                  200 → Connection
+POST   /admin/connections/{id}/revoke                  200 → Connection
+POST   /admin/connections/{id}/test                    200 → {ok, checked, status, detail, tools}
+POST   /admin/connections/{id}/oauth/start             200 → {authorize_url, state, …}
+GET    /admin/agents/{id}/connections                  200 → Connection[]  (broker order)
+POST   /admin/agents/{id}/connections                  201 → Connection[]
+DELETE /admin/agents/{id}/connections/{cid}            204
+GET    /admin/oauth/{provider}/callback     *** no auth — the browser lands here ***
 ```
 
-`providers[].configured` distinguishes "Bloom ships a manifest for this" from
-"this deployment has client credentials". Grey out a Connect button on
-`configured: false` and say why; the flow would otherwise fail at the redirect.
+**A connection is a library entry, not an agent's possession.** This is the change
+to build around. Previously an OAuth connection could only be created *through* an
+agent and was owned by it, so deleting the agent deleted the credential; a `shared`
+flag existed and nothing could ever set it. Now:
 
-`connection[]` carries `provider`, `status`, `scopes`, `expires_at`,
-`last_used_at`, `shared`. **It never carries a token value, and never will.**
-`status` is `pending | active | expired | needs_reauth | revoked`; anything but
-`active` means the agent cannot use that provider and is told so in its prompt.
+- creating from an agent's page attaches it, via `attach_to` in the same
+  transaction — one call, because "add a connection to this agent" is one intent
+  and two would invent a half-done state to recover from;
+- any other agent attaches the same row with `POST /admin/agents/{id}/connections`;
+- deleting an agent deletes **no** connections;
+- deleting a *connection* that is still attached is `409` naming the agents that
+  would lose it. Render that as a confirmation and retry with `?force=true` — it is
+  the one sharp edge of a shared library, so it asks rather than surprises.
 
-`503 unavailable` from `/start` means OAuth is not configured on the server
-(`BLOOM_FEATURE_OAUTH`, `BLOOM_FERNET_KEYS`, `BLOOM_PUBLIC_URL`). Storing a token
-without an encryption key is refused rather than downgraded.
+### Three kinds
+
+| `kind` | what it takes | what the agent gets |
+|---|---|---|
+| `oauth` | provider + client id/secret, then the browser | `<provider>_<operation>` tools, refreshed automatically |
+| `api_key` | provider + a pasted key | the same tools, static key |
+| `mcp` | `name` + `config.url` + optional bearer | every tool that server exposes, as `<name>__<tool>` |
+
+`name` is validated as `^[a-z][a-z0-9_-]{0,23}$` with no `__`. For `mcp` it is the
+tool namespace, so a `__` in it would make `<server>__<tool>` split in the wrong
+place.
+
+**No response ever carries a secret.** `has_secret` and `has_client_secret` are
+booleans; `client_id` comes back inside `config` because it is not a secret and the
+user must be able to see which app a connection is bound to. A `PATCH` carrying a
+secret is `422` — rotation goes through `POST /{id}/secret`, so a key cannot ride
+along on an ordinary edit and land in a request log.
+
+`tools[]` on every connection is what makes a picker useful: for a provider it is
+exactly the scope-filtered set the runner would register, and for a peer it is the
+namespace glob until `/test` connects and returns the real list.
+
+### Client credentials live on the connection
+
+`ConnectionIn` takes `client_id` and `client_secret` for an `oauth` connection.
+They resolve **connection first, environment second**: the manifest's
+`client_id_env` / `client_secret_env` are a deployment-wide default, reported as
+`has_deployment_default` on `/kinds`, and a connection carrying its own wins.
+
+This is why there is no longer a `configured` flag to grey a Connect button out of.
+It used to mean "this deployment has client credentials in `secrets.yaml`", which
+made connecting a provider a deployment operation — edit a secrets file on the box,
+reconcile, restart — for something a user should be able to do from a form. Missing
+credentials are now a `422` at create time, naming the blank field, rather than a
+`503` at the moment the browser was supposed to open.
 
 ### The browser handoff
 
-1. User clicks **Connect Spotify** on an agent.
-2. Aperture `POST`s `/oauth/spotify/start` and gets `authorize_url`.
-3. Aperture opens it with `shell.openExternal` (not a `BrowserWindow` — providers
-   increasingly refuse embedded webviews, and the system browser has the user's
-   existing session).
-4. User approves. The provider redirects to
-   `https://<bloom>/admin/oauth/spotify/callback?code=…&state=…`.
-5. Bloom exchanges the code, encrypts and stores the tokens, binds the connection,
-   and serves a page that redirects to:
+1. `POST /admin/connections` `{kind: "oauth", provider: "spotify", client_id, client_secret}`
+   → a row with `status: "pending"`.
+2. `POST /admin/connections/{id}/oauth/start` → `authorize_url`.
+3. Open it with `shell.openExternal` — not a `BrowserWindow`: providers
+   increasingly refuse embedded webviews, and the system browser has the session.
+4. The provider redirects to `https://<bloom>/admin/oauth/spotify/callback`.
+5. Bloom exchanges the code, encrypts and stores the tokens against **that
+   connection**, and serves a page redirecting to
+   `aperture://oauth-complete?provider=spotify&status=success`. It also renders
+   readable text, so the flow works before the scheme is registered.
+6. On the deep link: focus the window and **re-fetch** — do not trust the URL's
+   `status`, since the server already recorded the outcome.
 
-   ```
-   aperture://oauth-complete?provider=spotify&status=success
-   ```
+Re-running `/oauth/start` on a live connection is allowed and changes nothing until
+the callback succeeds: opening the page and abandoning the tab must not break a
+connection that already works.
 
-   `status` is `success` or `error`. The page also renders human-readable text, so
-   it works before step 6 exists.
-6. **To be built in Aperture:** register the scheme and handle the deep link.
-
-   ```ts
-   app.setAsDefaultProtocolClient('aperture')          // once, at startup
-   app.on('open-url', handle)                          // macOS
-   app.on('second-instance', (_e, argv) => handle(argv.find(a => a.startsWith('aperture://'))))
-   ```
-
-   Windows and Linux deliver the URL as an argv entry to a *second* instance, so
-   `requestSingleInstanceLock()` is required or the deep link silently opens a new
-   copy of the app instead of reaching the running one. On the event: focus the
-   window, and re-fetch `/admin/agents/{id}/oauth` — do not trust the URL's
-   `status` as the source of truth, since the server already recorded the outcome.
-
-The state is single-use and expires in 10 minutes; a replayed callback answers 400
-with a page telling the user to start again.
+`503` from `/start` or `/secret` means credentials cannot be stored at all
+(`BLOOM_FEATURE_OAUTH`, `BLOOM_FERNET_KEYS`). Storing a secret without a key is
+refused rather than downgraded. `/kinds` reports the same thing per kind as
+`available` + `reason`, so it can be shown *before* the user picks.
 
 ## Suggested build order in Aperture
 

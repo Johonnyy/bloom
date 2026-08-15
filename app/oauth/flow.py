@@ -39,7 +39,7 @@ from urllib.parse import urlencode
 from app.config import Settings, get_settings
 from app.crypto import encrypt
 from app.db import Store
-from app.providers import Provider
+from app.providers import ClientCredentials, Provider, client_for
 
 logger = logging.getLogger(__name__)
 
@@ -75,17 +75,33 @@ def _pkce_pair() -> tuple[str, str]:
 def start(
     store: Store,
     provider: Provider,
-    agent_config_id: str,
+    connection_id: str,
     *,
     scopes: list[str] | None = None,
     settings: Settings | None = None,
+    client: ClientCredentials | None = None,
 ) -> dict:
-    """Mint a state row and build the authorize URL Aperture should open."""
+    """Mint a state row and build the authorize URL Aperture should open.
+
+    The flow belongs to a **connection**, not to whichever agent happened to start
+    it. That is what makes one authorised account attachable to a second agent
+    without asking the user to approve the same thing twice.
+
+    Note what this does *not* do: touch the connection's status. Opening the
+    authorize page and abandoning the tab is a thing people do, and it must not
+    break a connection that already works — only a successful exchange writes.
+
+    ``client`` is the app registration to authorise against. Omitted, it falls back
+    to this deployment's environment — see `registry.client_for`.
+    """
     settings = settings or get_settings()
-    if not provider.configured:
+    client = client if client is not None else client_for(provider)
+    if not client:
         raise OAuthError(
-            f"{provider.display_name} has no client credentials. Set "
-            f"{provider.client_id_env} and {provider.client_secret_env} and restart."
+            f"{provider.display_name} has no client credentials. Give this connection "
+            "a client id and secret, or set "
+            f"{provider.client_id_env or '<client_id_env>'} and "
+            f"{provider.client_secret_env or '<client_secret_env>'} on the server."
         )
 
     callback = redirect_uri(provider.name, settings)
@@ -96,7 +112,7 @@ def start(
 
     store.create_oauth_state(
         state=state,
-        agent_config_id=agent_config_id,
+        connection_id=connection_id,
         provider=provider.name,
         code_verifier=verifier,
         redirect_uri=callback,
@@ -104,7 +120,7 @@ def start(
     )
 
     query = {
-        "client_id": provider.client_id,
+        "client_id": client.client_id,
         "response_type": "code",
         "redirect_uri": callback,
         "state": state,
@@ -131,9 +147,15 @@ async def exchange(
     *,
     settings: Settings | None = None,
     http_client_factory=None,
+    client: ClientCredentials | None = None,
 ) -> dict:
-    """Trade the authorization code for tokens and store the connection."""
+    """Trade the authorization code for tokens and store the connection.
+
+    ``client`` must be the same app registration ``start`` used; a code issued to
+    one client id cannot be redeemed by another.
+    """
     settings = settings or get_settings()
+    client = client if client is not None else client_for(provider)
 
     payload = {
         "grant_type": "authorization_code",
@@ -144,11 +166,11 @@ async def exchange(
     if state_row.get("code_verifier"):
         payload["code_verifier"] = state_row["code_verifier"]
     if provider.auth_style == "basic":
-        raw = f"{provider.client_id}:{provider.client_secret}".encode()
+        raw = f"{client.client_id}:{client.client_secret}".encode()
         headers["Authorization"] = "Basic " + base64.b64encode(raw).decode()
     else:
-        payload["client_id"] = provider.client_id
-        payload["client_secret"] = provider.client_secret
+        payload["client_id"] = client.client_id
+        payload["client_secret"] = client.client_secret
 
     import httpx2
 
@@ -187,19 +209,26 @@ async def exchange(
         expires_at = when.replace(microsecond=0).isoformat()
 
     refresh = data.get("refresh_token")
-    connection = store.upsert_connection(
-        provider=provider.name,
-        agent_config_id=state_row["agent_config_id"],
-        access_token=encrypt(access, settings),
+    connection = store.set_connection_secret(
+        state_row["connection_id"],
+        secret=encrypt(access, settings),
         refresh_token=encrypt(refresh, settings) if refresh else None,
         expires_at=expires_at,
         scopes=scopes,
         status="active",
     )
+    if connection is None:
+        # Deleted while the user was in the browser. Prose, not a 500: the callback
+        # renders whatever this says, and "it vanished, make it again" is actionable
+        # where a stack trace is not.
+        raise OAuthError(
+            "This connection no longer exists — it was deleted while you were "
+            "approving. Create it again in Aperture and reconnect."
+        )
     logger.info(
-        "Connected %s for agent config %s (%d scope(s), refresh token: %s)",
+        "Connected %s on connection %s (%d scope(s), refresh token: %s)",
         provider.name,
-        state_row["agent_config_id"],
+        state_row["connection_id"],
         len(scopes),
         "yes" if refresh else "no",
     )

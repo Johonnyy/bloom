@@ -112,12 +112,28 @@ def build_server(settings: Settings | None = None) -> AgentMCPServer:
     async def configured_agents() -> list[dict]:
         """Every configured agent: slug, name, tier, and what it can reach."""
         rows = await asyncio.to_thread(get_store().list_configs)
+        # One join rather than a query per row: this endpoint builds a list, and a
+        # per-agent read would scale with it.
+        attached = await asyncio.to_thread(get_store().connections_by_agent)
         return [
             {
                 "slug": r["slug"],
                 "name": r["name"],
                 "model_tier": r["model_tier"],
-                "mcp_servers": r["mcp_servers"],
+                # Capability, not configuration. A caller deciding whether to
+                # delegate needs to tell "has Spotify" from "had Spotify", so the
+                # status is here — but no ids, which are admin handles that mean
+                # nothing to a model, and nothing that could carry a secret.
+                "connections": [
+                    {
+                        "kind": c["kind"],
+                        "provider": c["provider"],
+                        "name": c["name"],
+                        "label": c["label"],
+                        "status": c["status"],
+                    }
+                    for c in attached.get(r["id"], ())
+                ],
                 # The prompt is the agent's *description* for a caller deciding
                 # whether to delegate, so it is served rather than hidden. It is
                 # configuration a human wrote, not a secret.
@@ -173,11 +189,21 @@ def build_server(settings: Settings | None = None) -> AgentMCPServer:
         rows = await asyncio.to_thread(get_store().list_configs)
         if not rows:
             return "No agents are configured yet."
+        attached = await asyncio.to_thread(get_store().connections_by_agent)
         lines = []
         for r in rows:
             summary = (r["system_prompt"] or "").strip().splitlines()
             headline = summary[0][:160] if summary else "(no description)"
-            lines.append(f"- {r['slug']}: {r['name'] or r['slug']} — {headline}")
+            # Only the active ones: a connection that cannot be used is not a
+            # capability, and naming it here would invite a caller to delegate a
+            # task that is going to fail.
+            live = [
+                c["label"] or c["name"]
+                for c in attached.get(r["id"], ())
+                if c["status"] == "active"
+            ]
+            suffix = f" [connected: {', '.join(live)}]" if live else ""
+            lines.append(f"- {r['slug']}: {r['name'] or r['slug']} — {headline}{suffix}")
         return "\n".join(lines)
 
     logger.info(

@@ -1,0 +1,90 @@
+# GitHub — the worked example for `auth = "api_key"`, and for a provider that
+# supports both ways of holding a credential.
+#
+# Spotify's manifest proves the OAuth path. This one exists so the API-key path is
+# exercised by something real rather than only by a test fixture: the two differ
+# solely in where the secret comes from, and a format whose second half is never
+# used in anger drifts.
+#
+# Nothing here is a secret. `client_id_env` / `client_secret_env` name a *deployment
+# default* — a connection may instead carry the credentials of the app it was
+# registered against, and those win. See `client_for` in registry.py.
+
+name = "github"
+display_name = "GitHub"
+api_base = "https://api.github.com"
+
+# Either kind of connection can hold a credential for this provider. A user who
+# just wants their own repos pastes a personal access token; a shared installation
+# runs the OAuth flow.
+auth = ["oauth", "api_key"]
+
+# --- required because "oauth" is in `auth` ---
+authorize_url = "https://github.com/login/oauth/authorize"
+token_url = "https://github.com/login/oauth/access_token"
+client_id_env = "BLOOM_OAUTH_GITHUB_CLIENT_ID"
+client_secret_env = "BLOOM_OAUTH_GITHUB_CLIENT_SECRET"
+
+# GitHub's OAuth apps do not support PKCE and take their client credentials in the
+# form body rather than a Basic header — the two knobs `auth_style` and `pkce` exist
+# for exactly this kind of divergence.
+pkce = false
+auth_style = "body"
+refresh_rotates = false
+
+scopes_default = ["public_repo", "read:user"]
+docs_url = "https://docs.github.com/en/rest"
+
+# --- required because "api_key" is in `auth` ---
+# Where a pasted key goes. GitHub accepts a bearer token in the standard header, so
+# this is the simple case; a provider wanting `?apikey=` would say in = "query".
+[api_key]
+in = "header"
+header = "Authorization"
+prefix = "Bearer "
+label = "Personal access token"
+help = "Create a fine-grained token at https://github.com/settings/tokens — it needs read access to the repositories you want the agent to see."
+
+# Cheap, read-only, argument-free: what "Test connection" calls.
+[probe]
+method = "GET"
+path = "/user"
+
+[[operations]]
+name = "whoami"
+method = "GET"
+path = "/user"
+read_only = true
+scopes = ["read:user"]
+description = """Who the connected GitHub account belongs to. Returns .login (the
+username), .name and .public_repos. Useful to confirm which account an agent is
+acting as before doing anything else."""
+[operations.params]
+
+[[operations]]
+name = "search_repos"
+method = "GET"
+path = "/search/repositories"
+read_only = true
+scopes = []
+description = """Search GitHub repositories. Returns .items[], each carrying
+.full_name, .description, .stargazers_count, .language and .html_url. Pass a
+returned .full_name to github_list_issues."""
+[operations.params]
+q = { in = "query", type = "string", required = true, description = "GitHub search syntax, e.g. 'fastapi language:python stars:>1000'." }
+sort = { in = "query", type = "string", enum = ["stars", "forks", "updated"], description = "Omit for best-match relevance." }
+per_page = { in = "query", type = "integer", default = 10, description = "1-100." }
+
+[[operations]]
+name = "list_issues"
+method = "GET"
+path = "/repos/{repo}/issues"
+read_only = true
+scopes = ["public_repo"]
+description = """Open issues on one repository. Returns a list, each with .number,
+.title, .state, .user.login and .html_url. A pull request also appears here and is
+distinguishable by having a .pull_request field."""
+[operations.params]
+repo = { in = "path", type = "string", required = true, description = "owner/name, e.g. 'encode/httpx'." }
+state = { in = "query", type = "string", enum = ["open", "closed", "all"], default = "open" }
+per_page = { in = "query", type = "integer", default = 10, description = "1-100." }

@@ -62,6 +62,102 @@ def test_query_tools_are_marked_read_only():
     assert policies["list_agents"].read_only is True
 
 
+# --- what a delegating agent is told about capability ---
+
+
+def _configured(tmp_path, *connections):
+    """A store with one agent and whatever connections the test cares about."""
+    from app import db as db_module
+
+    store = db_module.Store(str(tmp_path / "bloom.db"))
+    config = store.create_config(slug="dj", name="DJ", system_prompt="You pick music.")
+    for spec in connections:
+        store.create_connection(attach_to=[config["id"]], **spec)
+    return store, config
+
+
+def test_the_agents_resource_publishes_capability_not_configuration(tmp_path, monkeypatch):
+    """A caller deciding whether to delegate needs "has Spotify" vs "had Spotify".
+
+    It does *not* need connection ids — those are admin handles that mean nothing
+    to a model — and must never see anything that could carry a secret.
+    """
+    from app import db as db_module
+
+    store, _ = _configured(
+        tmp_path,
+        {
+            "kind": "oauth",
+            "provider": "spotify",
+            "name": "spotify",
+            "label": "Spotify",
+            "status": "active",
+        },
+        {
+            "kind": "mcp",
+            "name": "amber",
+            "config": {"url": "https://amber.example"},
+            "status": "revoked",
+        },
+    )
+    monkeypatch.setattr(db_module, "get_store", lambda: store)
+
+    rows = store.list_configs()
+    attached = store.connections_by_agent()[rows[0]["id"]]
+    published = [
+        {k: c[k] for k in ("kind", "provider", "name", "label", "status")} for c in attached
+    ]
+
+    assert published == [
+        {
+            "kind": "oauth",
+            "provider": "spotify",
+            "name": "spotify",
+            "label": "Spotify",
+            "status": "active",
+        },
+        {
+            "kind": "mcp",
+            "provider": None,
+            "name": "amber",
+            "label": "",
+            "status": "revoked",
+        },
+    ]
+    for entry in published:
+        assert "id" not in entry
+        assert "secret" not in entry
+    store.close()
+
+
+def test_only_active_connections_are_named_as_capability(tmp_path):
+    """A connection that cannot be used is not a capability.
+
+    Naming a revoked one would invite a caller to delegate a task that is going to
+    fail, which is worse than not mentioning it.
+    """
+    store, config = _configured(
+        tmp_path,
+        {
+            "kind": "oauth",
+            "provider": "spotify",
+            "name": "spotify",
+            "label": "Spotify",
+            "status": "active",
+        },
+        {
+            "kind": "mcp",
+            "name": "amber",
+            "config": {"url": "https://amber.example"},
+            "status": "needs_reauth",
+        },
+    )
+    attached = store.connections_by_agent()[config["id"]]
+    live = [c["label"] or c["name"] for c in attached if c["status"] == "active"]
+    assert live == ["Spotify"]
+    store.close()
+
+
 def test_no_tool_demands_a_confirmation_nothing_can_supply():
     """``requires_confirmation`` is only satisfiable by an inbound X-Confirmed
     header. With no UI able to send one, a marked tool would be permanently

@@ -52,6 +52,7 @@ from agent_runtime import Settings as RuntimeSettings
 
 from app.config import Settings, get_settings
 from app.credentials import CredentialResolver
+from app.crypto import UndecryptableToken, decrypt
 from app.db import Store, get_store, new_id
 from app.providers import get_provider, register_operations
 from app.trace import RunRecorder, TracingBroker, get_writer
@@ -81,36 +82,13 @@ def runtime_settings(settings: Settings | None = None) -> RuntimeSettings:
     )
 
 
-def _known_peers(names: list[str]) -> list[str]:
-    """Drop peers that cannot be resolved right now, loudly.
+def _connection_broker(
+    connections: list[dict], config: dict, store: Store, settings: Settings
+) -> Any | None:
+    """Tools backed by this agent's provider connections — OAuth and API key alike.
 
-    `MCPClient` tolerates a peer that is *unreachable* — it warns and skips — but a
-    name it cannot resolve at all raises. Filtering here turns "an agent named a
-    peer that has not registered yet" into a degraded run with a warning instead of
-    a failed one, which matches the edit-time behaviour: naming a future peer is
-    allowed.
-    """
-    if not names:
-        return []
-    try:
-        from agent_mcp.registry import known_peers
-
-        available = set(known_peers())
-    except Exception:  # noqa: BLE001 — no registry means no peers, not a failed run
-        logger.warning("Peer registry unavailable; running without peer tools")
-        return []
-    usable = [n for n in names if n in available]
-    missing = [n for n in names if n not in available]
-    if missing:
-        logger.warning("Skipping unresolvable peer(s): %s", ", ".join(missing))
-    return usable
-
-
-def _credential_broker(config: dict, store: Store, settings: Settings) -> Any | None:
-    """Tools backed by this config's connected accounts, or ``None`` if it has none.
-
-    One `LocalToolBroker` holding every operation the bound connections can
-    perform. Each tool closes over a *connection id*, never a token — see
+    One `LocalToolBroker` holding every operation the attached connections can
+    perform. Each tool closes over a *connection id*, never a secret — see
     `app.credentials` for why resolving at call time is what makes a token
     expiring mid-run survivable.
 
@@ -121,15 +99,12 @@ def _credential_broker(config: dict, store: Store, settings: Settings) -> Any | 
     if not settings.oauth_enabled:
         return None
 
-    connections = store.connections_for(config["id"])
-    if not connections:
-        return None
-
     broker = LocalToolBroker()
     resolver = CredentialResolver(store, settings)
+    seen: set[str] = set()
     registered = 0
     for connection in connections:
-        if connection["status"] != "active":
+        if connection["kind"] not in {"oauth", "api_key"} or connection["status"] != "active":
             continue
         provider = get_provider(connection["provider"])
         if provider is None:
@@ -139,12 +114,30 @@ def _credential_broker(config: dict, store: Store, settings: Settings) -> Any | 
                 connection["provider"],
             )
             continue
+        if connection["provider"] in seen:
+            # The attach endpoint refuses this with a 409, so reaching here means a
+            # hand-edited database. Skipping beats registering two tools under one
+            # name and letting the broker silently pick.
+            logger.warning(
+                "Config %s attaches two %s connections; using the first",
+                config["slug"],
+                connection["provider"],
+            )
+            continue
+        seen.add(connection["provider"])
         registered += register_operations(
             broker,
             provider,
             connection["id"],
             resolver,
-            granted_scopes=connection["scopes"],
+            # OAuth: the granted scopes bound what the token can do. API key: the
+            # provider's own console did, invisibly — so unscoped unless an operator
+            # deliberately narrowed it.
+            granted_scopes=(
+                connection["scopes"]
+                if connection["kind"] == "oauth"
+                else (connection["scopes"] or None)
+            ),
         )
 
     if not registered:
@@ -153,7 +146,55 @@ def _credential_broker(config: dict, store: Store, settings: Settings) -> Any | 
     return broker
 
 
-def _connection_notes(config: dict, store: Store, settings: Settings) -> str:
+def _peer_resolver(
+    connections: list[dict], store: Store, settings: Settings
+) -> tuple[list[str], dict[str, dict]]:
+    """The peer names and the plain mapping `MCPClient` resolves them through.
+
+    This replaces looking names up in `agent_mcp.registry`: a peer is now a stored
+    connection carrying its own URL and bearer, so an agent reaches exactly what it
+    was given rather than whatever a shared registry happens to hold.
+
+    Peer bearers are decrypted **here, at build time** — the opposite of the rule
+    for provider tokens, for reasons that do not apply to them:
+
+    * a peer bearer is a static token an operator set, not a grant that expires
+      mid-run, so the failure `app.credentials` exists to prevent cannot happen;
+    * `MCPClient` opens one session per server and caches it, setting
+      ``Authorization`` once at session open — late resolution could not change a
+      header that is already fixed for the life of the client;
+    * its ``_resolve`` is *synchronous*, so a lazy mapping would put a SQLite read
+      and a Fernet decrypt on the event loop, against the house rule that every
+      store call is wrapped in ``asyncio.to_thread``.
+
+    The plaintext lives in this mapping and in the client's own headers for one run,
+    then goes with them. It never reaches the model, a tool argument, or the trace.
+    """
+    names: list[str] = []
+    mapping: dict[str, dict] = {}
+    for connection in connections:
+        if connection["kind"] != "mcp" or connection["status"] != "active":
+            continue
+        url = str((connection["config"] or {}).get("url") or "").strip()
+        if not url:
+            logger.warning("MCP connection %s has no url; skipping", connection["name"])
+            continue
+        record: dict[str, Any] = {"base_url": url}
+        row = store.connection_secrets(connection["id"])
+        if row is not None and row["secret"]:
+            try:
+                record["token"] = decrypt(row["secret"], settings)
+            except UndecryptableToken:
+                logger.exception(
+                    "MCP connection %s cannot be decrypted; skipping", connection["name"]
+                )
+                continue
+        names.append(connection["name"])
+        mapping[connection["name"]] = record
+    return names, mapping
+
+
+def _connection_notes(connections: list[dict], settings: Settings) -> str:
     """A line per unusable connection, appended to the system prompt.
 
     Without this the model sees no Spotify tools and improvises — usually by
@@ -163,8 +204,15 @@ def _connection_notes(config: dict, store: Store, settings: Settings) -> str:
     if not settings.oauth_enabled:
         return ""
     notes = []
-    for connection in store.connections_for(config["id"]):
+    for connection in connections:
         if connection["status"] == "active":
+            continue
+        if connection["kind"] == "mcp":
+            notes.append(
+                f"- The {connection['label'] or connection['name']} server is not "
+                f"currently reachable ({connection['status']}), so its "
+                f"{connection['name']}__* tools are unavailable."
+            )
             continue
         provider = get_provider(connection["provider"])
         label = provider.display_name if provider else connection["provider"]
@@ -187,16 +235,21 @@ def build_runner(
     settings = settings or get_settings()
     store = store or get_store()
 
+    # Read once and pass down: this used to be three separate queries per build.
+    connections = store.connections_for(config["id"])
+
     brokers: list[Any] = []
     # Credential tools first: a peer server must never be able to shadow a tool
     # that carries the user's own account access.
-    credentials = _credential_broker(config, store, settings)
+    credentials = _connection_broker(connections, config, store, settings)
     if credentials is not None:
         brokers.append(credentials)
 
-    peers = _known_peers(list(config.get("mcp_servers") or ()))
+    peers, peer_records = _peer_resolver(connections, store, settings)
     if peers:
-        brokers.append(MCPClient(peers))
+        # One client for every peer, resolving through a plain mapping — the sync
+        # store registry is bypassed entirely.
+        brokers.append(MCPClient(peers, resolver=peer_records))
 
     inner = None
     if len(brokers) == 1:
@@ -212,7 +265,7 @@ def build_runner(
     max_steps = min(config.get("max_steps") or settings.max_steps, settings.max_steps)
     max_cost = min(config.get("max_cost_usd") or settings.max_cost_usd, settings.max_cost_usd)
 
-    system_prompt = (config.get("system_prompt") or "") + _connection_notes(config, store, settings)
+    system_prompt = (config.get("system_prompt") or "") + _connection_notes(connections, settings)
 
     runner = AgentRunner(
         model=config.get("model_tier") or settings.default_tier,

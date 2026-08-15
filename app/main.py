@@ -26,8 +26,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.admin.agents import router as agents_router
-from app.admin.oauth_routes import public_router as oauth_public_router
-from app.admin.oauth_routes import router as oauth_router
+from app.admin.connections import router as connections_router
+from app.admin.oauth_callback import public_router as oauth_public_router
 from app.admin.runs import router as runs_router
 from app.admin.usage import router as usage_router
 from app.config import Settings, get_settings
@@ -106,10 +106,10 @@ app.include_router(health_router)
 app.include_router(agents_router)
 app.include_router(runs_router)
 app.include_router(usage_router)
-app.include_router(oauth_router)
+app.include_router(connections_router)
 # Unauthenticated by design — the provider redirects a browser here, which carries
 # no bearer token. Its security is a single-use state row plus PKCE. See
-# app/admin/oauth_routes.py; do not add a second route to this router.
+# app/admin/oauth_callback.py; do not add a second route to this router.
 app.include_router(oauth_public_router)
 
 

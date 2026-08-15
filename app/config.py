@@ -19,14 +19,36 @@ variables holding its client id and secret, and `app.providers.registry` reads
 them by that name — the set of providers is not known when this class is defined,
 and putting them here would mean editing Python to add a provider, which is the
 exact thing the manifest format exists to avoid.
+
+That indirection is also why `load_dotenv` is called below; see its comment.
 """
 
 from __future__ import annotations
 
 from functools import lru_cache
 
+from dotenv import load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# The one deliberate export of `.env` into the process environment.
+#
+# pydantic-settings reads `.env` into the *model* without exporting it, so a
+# variable named by a provider manifest rather than declared below — every
+# ``BLOOM_OAUTH_<PROVIDER>_CLIENT_ID`` — resolves under Docker (whose ``env_file``
+# genuinely exports) and silently does not under a bare ``uvicorn``. The symptom is
+# a provider reporting itself unconfigured while its credentials sit in `.env`.
+# This is the same trap `app/mcp.py` documents for ``auth_keys_env``; there the fix
+# was to drop the indirection, and here the indirection is the feature.
+#
+# ``override=False`` is load-bearing: a real environment variable still wins, so
+# compose, systemd and a test's ``monkeypatch.setenv`` all behave exactly as before.
+#
+# The path is given explicitly rather than left to ``find_dotenv``, which walks up
+# from *this file* while ``env_file`` below resolves against the working directory.
+# Same string, same semantics: either both find the file or neither does, and there
+# is never one half of the config reading a `.env` the other half cannot see.
+load_dotenv(".env", override=False)
 
 
 class Settings(BaseSettings):

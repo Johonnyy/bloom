@@ -51,7 +51,7 @@ async def refresh_due(
         # Through the resolver, not a private helper: it holds the per-connection
         # lock, so a sweep and an in-flight run cannot both spend the same
         # rotating refresh token and permanently break the grant.
-        if await resolver.access_token(row["id"], force_refresh=True):
+        if await resolver.secret(row["id"], force_refresh=True):
             refreshed += 1
     if refreshed:
         logger.info("Proactively refreshed %d connection(s)", refreshed)

@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 from app.config import Settings
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _settings(**over) -> Settings:
@@ -63,3 +70,58 @@ def test_the_app_name_is_a_legal_mcp_namespace():
     from agent_mcp.schema import validate_app_name
 
     validate_app_name(_settings().app_name)
+
+
+def _import_config_in(cwd: Path, expr: str, env: dict[str, str] | None = None) -> str:
+    """Import `app.config` in a fresh interpreter and print ``expr``.
+
+    A subprocess because the export happens once, at import, and the whole point of
+    the test is what a *newly started* Bloom sees. Monkeypatching inside this
+    process would test something else.
+    """
+    # The parent environment is inherited, not replaced: on Windows a Python
+    # started without SYSTEMROOT/PATH cannot load its own DLLs. The variable under
+    # test is cleared explicitly instead.
+    child = {**os.environ, "PYTHONPATH": str(_REPO_ROOT)}
+    child.pop("BLOOM_OAUTH_ACME_CLIENT_ID", None)
+    child.update(env or {})
+    proc = subprocess.run(
+        [sys.executable, "-c", f"import os, app.config; print({expr})"],
+        cwd=cwd,
+        env=child,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return proc.stdout.strip()
+
+
+def test_dotenv_reaches_variables_settings_does_not_declare(tmp_path):
+    """A provider manifest's credentials must work from `.env`, not only from Docker.
+
+    ``BLOOM_OAUTH_*`` is named by a TOML manifest and read from ``os.environ`` by
+    `app.providers.registry`; it is deliberately not a field on Settings. Since
+    pydantic-settings loads `.env` into the *model* without exporting it, without
+    the ``load_dotenv`` call in `app.config` this resolves under compose's
+    ``env_file`` and silently not under a bare ``uvicorn`` — a provider reporting
+    itself unconfigured while its credentials sit in the file.
+    """
+    (tmp_path / ".env").write_text("BLOOM_OAUTH_ACME_CLIENT_ID=from-dotenv\n")
+    out = _import_config_in(tmp_path, "os.environ.get('BLOOM_OAUTH_ACME_CLIENT_ID')")
+    assert out == "from-dotenv"
+
+
+def test_a_real_environment_variable_still_wins_over_dotenv(tmp_path):
+    """``override=False``, so compose, systemd and monkeypatch.setenv are unchanged."""
+    (tmp_path / ".env").write_text("BLOOM_OAUTH_ACME_CLIENT_ID=from-dotenv\n")
+    out = _import_config_in(
+        tmp_path,
+        "os.environ.get('BLOOM_OAUTH_ACME_CLIENT_ID')",
+        env={"BLOOM_OAUTH_ACME_CLIENT_ID": "from-the-environment"},
+    )
+    assert out == "from-the-environment"
+
+
+def test_no_dotenv_is_not_an_error(tmp_path):
+    """A fresh clone with no `.env` must still import."""
+    assert _import_config_in(tmp_path, "os.environ.get('BLOOM_OAUTH_ACME_CLIENT_ID')") == "None"

@@ -27,6 +27,22 @@ is one that would otherwise appear as a confusing runtime error:
 * No parameter may live in a header, and none may be named ``authorization``,
   ``token``, ``access_token``, ``api_key`` or ``cookie``. That denylist is the
   thing standing between a model-authored argument and a secret in the log.
+
+**Two ways to hold a credential, one way to use one.** ``auth`` declares which a
+provider supports: ``oauth`` (a grant Bloom obtains and refreshes) or ``api_key``
+(a key the user pastes). It changes only where the secret comes from — the
+operations, their schemas, the scope filter and the denylist above are identical,
+which is what makes "a new provider is a TOML file" true for both. A manifest that
+says nothing is ``oauth``, so every file written before this existed is unchanged
+and keeps every guarantee it had.
+
+**Client credentials resolve connection-first, environment-second.** A connection
+may carry the client id and secret of the app it was registered against; a manifest
+names environment variables holding a deployment-wide default. :func:`client_for`
+is the one place that order is decided. The environment used to be the only option,
+which made connecting a provider a deployment operation — editing a secrets file on
+the box and restarting the container — for something a user should be able to do
+from a form.
 """
 
 from __future__ import annotations
@@ -60,6 +76,11 @@ FORBIDDEN_PARAMS = frozenset(
 ALLOWED_PARAM_LOCATIONS = frozenset({"query", "path", "body"})
 
 _JSON_TYPES = frozenset({"string", "integer", "number", "boolean", "array", "object"})
+
+# How a connection may hold a credential for a provider. `mcp` is a connection kind
+# but never a provider one — a peer server has no manifest.
+AUTH_METHODS = frozenset({"oauth", "api_key"})
+API_KEY_LOCATIONS = frozenset({"header", "query"})
 
 
 class ManifestError(ValueError):
@@ -113,14 +134,65 @@ class Operation:
 
 
 @dataclass(frozen=True)
+class ApiKeySpec:
+    """Where a pasted key goes on an outbound request.
+
+    Declared per provider because there is no convention worth guessing: some want
+    ``Authorization: Bearer``, some a bespoke header, some a query parameter.
+    """
+
+    location: str  # header | query
+    header: str = ""
+    prefix: str = ""
+    query_param: str = ""
+    label: str = "API key"
+    help: str = ""
+
+    def apply(self, secret: str) -> tuple[dict[str, str], dict[str, str]]:
+        """``(headers, params)`` for one request — the only place a key becomes wire."""
+        if self.location == "header":
+            return {self.header: f"{self.prefix}{secret}"}, {}
+        return {}, {self.query_param: secret}
+
+
+@dataclass(frozen=True)
+class Probe:
+    """A cheap authenticated request that proves a credential works.
+
+    Deliberately not an ``Operation``: it takes no model-authored arguments, is
+    never registered as a tool, and exists only so "test this connection" can
+    answer with something better than "the token decrypts".
+    """
+
+    method: str = "GET"
+    path: str = "/"
+
+
+@dataclass(frozen=True)
+class ClientCredentials:
+    """The app credentials one connection authorises with, and where they came from."""
+
+    client_id: str = ""
+    client_secret: str = ""
+    source: str = ""  # connection | environment
+
+    def __bool__(self) -> bool:
+        return bool(self.client_id and self.client_secret)
+
+
+@dataclass(frozen=True)
 class Provider:
     name: str
     display_name: str
-    authorize_url: str
-    token_url: str
     api_base: str
-    client_id_env: str
-    client_secret_env: str
+    # Empty for a provider that supports only `api_key` — there is no flow to run.
+    authorize_url: str = ""
+    token_url: str = ""
+    client_id_env: str = ""
+    client_secret_env: str = ""
+    auth_methods: tuple[str, ...] = ("oauth",)
+    api_key: ApiKeySpec | None = None
+    probe: Probe | None = None
     scopes_default: tuple[str, ...] = ()
     operations: tuple[Operation, ...] = ()
     pkce: bool = True
@@ -129,23 +201,49 @@ class Provider:
     docs_url: str = ""
     revoke_url: str = ""
 
-    @property
-    def client_id(self) -> str:
-        return os.environ.get(self.client_id_env, "")
+    def supports(self, kind: str) -> bool:
+        """Whether a connection of this kind can hold a credential for this provider."""
+        return kind in self.auth_methods
 
     @property
-    def client_secret(self) -> str:
-        return os.environ.get(self.client_secret_env, "")
+    def env_client_id(self) -> str:
+        return os.environ.get(self.client_id_env, "") if self.client_id_env else ""
 
     @property
-    def configured(self) -> bool:
-        """Whether this provider can actually start a flow.
+    def env_client_secret(self) -> str:
+        return os.environ.get(self.client_secret_env, "") if self.client_secret_env else ""
 
-        A manifest ships with the image; the credentials do not. Reporting the
-        difference is what lets Aperture grey out "Connect Spotify" with a reason
-        instead of failing at the redirect.
+    @property
+    def has_deployment_default(self) -> bool:
+        """Whether this box carries client credentials for the provider.
+
+        A hint, not a gate: a connection that carries its own does not need one.
+        Reporting it lets a create form prefill instead of asking.
         """
-        return bool(self.client_id and self.client_secret)
+        return bool(self.env_client_id and self.env_client_secret)
+
+
+def client_for(
+    provider: Provider,
+    *,
+    client_id: str = "",
+    client_secret: str = "",
+) -> ClientCredentials:
+    """Resolve the app credentials for one connection: its own first, then the box.
+
+    The caller passes what the connection stores — ``client_id`` from its config and
+    ``client_secret`` already decrypted, because decryption needs the cipher and this
+    module deliberately knows nothing about it.
+
+    Both halves must come from the same place. Mixing a connection's client id with
+    the environment's secret would produce an ``invalid_client`` from the provider
+    and a support question that no log answers.
+    """
+    if client_id and client_secret:
+        return ClientCredentials(client_id, client_secret, "connection")
+    if provider.has_deployment_default:
+        return ClientCredentials(provider.env_client_id, provider.env_client_secret, "environment")
+    return ClientCredentials()
 
 
 def _param(name: str, raw: dict, *, where: str) -> Param:
@@ -219,6 +317,78 @@ def _operation(provider_name: str, raw: dict) -> Operation:
     )
 
 
+def _auth_methods(where: str, raw: Any) -> tuple[str, ...]:
+    """Parse ``auth``, accepting a bare string or a list.
+
+    Absent means ``oauth``: every manifest written before this key existed keeps
+    exactly the behaviour it had.
+    """
+    if raw is None:
+        return ("oauth",)
+    values = [raw] if isinstance(raw, str) else list(raw)
+    methods = tuple(str(v).strip().lower() for v in values)
+    if not methods:
+        raise ManifestError(f"{where}: 'auth' is empty; omit it to mean 'oauth'")
+    for method in methods:
+        if method not in AUTH_METHODS:
+            raise ManifestError(
+                f"{where}: unknown auth method {method!r}; allowed: "
+                f"{', '.join(sorted(AUTH_METHODS))}"
+            )
+    return methods
+
+
+def _api_key_spec(where: str, raw: Any, operations: tuple[Operation, ...]) -> ApiKeySpec:
+    if not isinstance(raw, dict):
+        raise ManifestError(f"{where}: 'auth' includes api_key, so an [api_key] table is required")
+    location = str(raw.get("in", "header")).lower()
+    if location not in API_KEY_LOCATIONS:
+        raise ManifestError(
+            f"{where}: [api_key] in={location!r}; allowed: "
+            f"{', '.join(sorted(API_KEY_LOCATIONS))} (a body-borne key is not supported)"
+        )
+    header = str(raw.get("header", "")).strip()
+    query_param = str(raw.get("query_param", "")).strip()
+    if location == "header" and not header:
+        raise ManifestError(f"{where}: [api_key] in='header' needs a 'header' name")
+    if location == "query":
+        if not query_param:
+            raise ManifestError(f"{where}: [api_key] in='query' needs a 'query_param' name")
+        # A declared parameter of the same name would be merged over by the
+        # credential, so the model would author an argument the schema advertises
+        # and silently never send it — one operation, at run time, as a wrong
+        # answer. Cheaper to refuse the manifest.
+        for op in operations:
+            for param in op.params:
+                if param.name == query_param:
+                    raise ManifestError(
+                        f"{where}: [api_key] query_param {query_param!r} collides with "
+                        f"a parameter of operation {op.name!r}; the credential would "
+                        "silently displace the model's argument"
+                    )
+    return ApiKeySpec(
+        location=location,
+        header=header,
+        prefix=str(raw.get("prefix", "")),
+        query_param=query_param,
+        label=str(raw.get("label", "API key")),
+        help=str(raw.get("help", "")),
+    )
+
+
+def _probe(where: str, raw: Any) -> Probe | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ManifestError(f"{where}: [probe] must be a table")
+    method = str(raw.get("method", "GET")).upper()
+    if method not in {"GET", "HEAD"}:
+        # A probe fires on a button press with no confirmation, so it is read-only
+        # by construction rather than by the manifest author remembering.
+        raise ManifestError(f"{where}: [probe] method {method!r} must be GET or HEAD")
+    return Probe(method=method, path=str(raw.get("path", "/")))
+
+
 def load_manifest(path: Path) -> Provider:
     """Parse and validate one manifest file."""
     try:
@@ -232,9 +402,20 @@ def load_manifest(path: Path) -> Provider:
             f"{path.name}: 'name' must be snake_case and at most 20 characters "
             "(it prefixes every tool this provider contributes)"
         )
-    for required in ("authorize_url", "token_url", "api_base", "client_id_env"):
-        if not raw.get(required):
-            raise ManifestError(f"{path.name}: missing required key {required!r}")
+    if not raw.get("api_base"):
+        raise ManifestError(f"{path.name}: missing required key 'api_base'")
+
+    auth_methods = _auth_methods(path.name, raw.get("auth"))
+    # Required *because of* what this provider declares it supports, rather than
+    # unconditionally: an api_key-only provider has no authorize endpoint and no
+    # client credentials to name, and demanding them would mean inventing values.
+    if "oauth" in auth_methods:
+        for required in ("authorize_url", "token_url"):
+            if not raw.get(required):
+                raise ManifestError(
+                    f"{path.name}: missing required key {required!r} (this provider's "
+                    "'auth' includes oauth)"
+                )
 
     operations = tuple(_operation(name, op) for op in raw.get("operations", ()) or ())
     seen: set[str] = set()
@@ -243,14 +424,23 @@ def load_manifest(path: Path) -> Provider:
             raise ManifestError(f"{name}: duplicate operation {op.name!r}")
         seen.add(op.name)
 
+    api_key = (
+        _api_key_spec(path.name, raw.get("api_key"), operations)
+        if "api_key" in auth_methods
+        else None
+    )
+
     return Provider(
         name=name,
         display_name=str(raw.get("display_name", name.title())),
-        authorize_url=str(raw["authorize_url"]),
-        token_url=str(raw["token_url"]),
         api_base=str(raw["api_base"]).rstrip("/"),
-        client_id_env=str(raw["client_id_env"]),
+        authorize_url=str(raw.get("authorize_url", "")),
+        token_url=str(raw.get("token_url", "")),
+        client_id_env=str(raw.get("client_id_env", "")),
         client_secret_env=str(raw.get("client_secret_env", "")),
+        auth_methods=auth_methods,
+        api_key=api_key,
+        probe=_probe(path.name, raw.get("probe")),
         scopes_default=tuple(str(s) for s in raw.get("scopes_default", ()) or ()),
         operations=operations,
         pkce=bool(raw.get("pkce", True)),
@@ -332,14 +522,22 @@ def _summarise(status: int, text: str) -> str:
     return body or f"HTTP {status}: (empty response — the request succeeded)"
 
 
-def operations_for(provider: Provider, granted_scopes: Iterable[str]) -> list[Operation]:
-    """Operations this grant can actually perform.
+def operations_for(provider: Provider, granted_scopes: Iterable[str] | None) -> list[Operation]:
+    """Operations this credential can actually perform.
 
     Filtering by scope is not cosmetic: offering a tool the token cannot authorise
     means the model spends a step, gets a 403, and has to recover — when the
     information needed to avoid that was available before the run started.
+
+    ``None`` means *unscoped*, and is not the same as an empty list. An API key's
+    permissions are set in the provider's own console and Bloom has no way to read
+    them, so filtering would hide capability the key may well have. An operator who
+    knows a key is narrow says so by storing scopes on the connection; an empty list
+    still means "nothing beyond the unscoped operations", as it always did.
     """
-    granted = set(granted_scopes or ())
+    if granted_scopes is None:
+        return list(provider.operations)
+    granted = set(granted_scopes)
     usable, skipped = [], []
     for op in provider.operations:
         if set(op.scopes) <= granted:
@@ -361,7 +559,7 @@ def register_operations(
     connection_id: str,
     resolver: Any,
     *,
-    granted_scopes: Iterable[str] = (),
+    granted_scopes: Iterable[str] | None = (),
     http_client_factory: Any = None,
 ) -> int:
     """Register this connection's operations on a ``LocalToolBroker``.
@@ -391,11 +589,16 @@ def _make_caller(
     resolver: Any,
     http_client_factory: Any,
 ):
-    """Build the callable for one operation, closed over the *connection id*."""
+    """Build the callable for one operation, closed over the *connection id*.
+
+    The connection id and not the secret: that is what lets a token expire mid-run
+    and be refreshed instead of failing the task, and it is why the plaintext never
+    outlives one request.
+    """
 
     async def call(**kwargs: Any) -> str:
-        token = await resolver.access_token(connection_id)
-        if not token:
+        cred = await resolver.credential(connection_id)
+        if not cred:
             return (
                 f"{provider.display_name} is not connected, or its authorisation has "
                 "expired. Ask the user to reconnect it in Aperture."
@@ -407,34 +610,38 @@ def _make_caller(
         import httpx2
 
         factory = http_client_factory or httpx2.AsyncClient
-        async with factory() as client:
-            response = await client.request(
-                op.method,
-                url,
-                params=query or None,
-                json=body or None,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=30.0,
-            )
+
+        async def send(credential):
+            async with factory() as client:
+                return await client.request(
+                    op.method,
+                    url,
+                    # Credential parameters merged last. `_split_args` already drops
+                    # anything undeclared and FORBIDDEN_PARAMS refuses a
+                    # credential-shaped parameter name at manifest load, so this
+                    # cannot actually be reached — belt and braces on the one thing
+                    # that must never be model-settable.
+                    params={**query, **credential.params} or None,
+                    json=body or None,
+                    headers=credential.headers,
+                    timeout=30.0,
+                )
+
+        response = await send(cred)
 
         if response.status_code == 401:
-            # One retry after a forced refresh: a token can lapse between the
-            # resolver's expiry check and the provider receiving the request.
-            token = await resolver.access_token(connection_id, force_refresh=True)
-            if token:
-                async with factory() as client:
-                    response = await client.request(
-                        op.method,
-                        url,
-                        params=query or None,
-                        json=body or None,
-                        headers={"Authorization": f"Bearer {token}"},
-                        timeout=30.0,
-                    )
+            # One retry after a forced refresh, but only for a credential that can
+            # be refreshed: a grant can lapse between the resolver's expiry check
+            # and the provider receiving the request, while a static key that was
+            # just rejected will be rejected again.
+            if cred.refreshable:
+                cred = await resolver.credential(connection_id, force_refresh=True)
+                if cred:
+                    response = await send(cred)
             if response.status_code == 401:
                 await resolver.mark_needs_reauth(connection_id)
                 return (
-                    f"{provider.display_name} rejected the stored authorisation. "
+                    f"{provider.display_name} rejected the stored credential. "
                     "Ask the user to reconnect it in Aperture."
                 )
 

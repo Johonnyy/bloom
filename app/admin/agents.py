@@ -1,19 +1,24 @@
 """CRUD for agent configurations — the first thing Aperture will talk to.
 
 An `AgentConfig` is the whole point of Bloom: a name, a system prompt, a model
-tier, a set of peer MCP servers, and (later) OAuth bindings. Defining one here is
-what replaces building and deploying a standalone app for a single integration.
+tier. Defining one here is what replaces building and deploying a standalone app
+for a single integration.
+
+**Creating an agent asks for nothing about what it can reach.** It used to take an
+``mcp_servers`` list — free text, never validated, resolved late against a registry
+that may not know those names yet — at the one moment the answer is least knowable:
+before the agent exists. Capability is attached afterwards, as connections, and
+lives in `app.admin.connections`.
 
 These request and response models *are* the contract Aperture generates a client
 from, so they are written as the public surface they are rather than as thin
-wrappers over table rows: the join table becomes an ``oauth_connections`` list, the
-JSON column becomes a real array, and nothing about the storage shape leaks.
+wrappers over table rows: the join table becomes a ``connections`` list of ids and
+nothing about the storage shape leaks.
 
-**Validation is strict where a mistake is expensive and advisory where it is
-not.** An unknown model tier is rejected: it would fail at the first run with an
-error from inside the runtime, far from the edit that caused it. An unknown peer
-name is only warned about, because a peer may legitimately register *after* the
-config that names it — rejecting would make configuration order load-bearing.
+**Unknown fields are refused rather than ignored.** Pydantic's default is to drop
+them, which on a clean API break means a stale client sending ``mcp_servers``
+would get a 201 and an agent that silently reaches nothing. ``extra="forbid"``
+turns that into a 422 naming the field.
 """
 
 from __future__ import annotations
@@ -24,7 +29,7 @@ import logging
 from agent_runtime.model_router import UnknownTier
 from agent_runtime.model_router import resolve as resolve_tier
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.admin.deps import require_admin
 from app.db import SlugTaken, Store, get_store
@@ -54,13 +59,14 @@ def _validate_tier(value: str) -> str:
 class AgentConfigIn(BaseModel):
     """Everything a caller may set when creating a config."""
 
+    model_config = ConfigDict(extra="forbid")
+
     slug: str = Field(
         pattern=_SLUG, description="How a caller names this agent, e.g. 'spotify-dj'."
     )
     name: str = ""
     system_prompt: str = ""
     model_tier: str = "balanced"
-    mcp_servers: list[str] = Field(default_factory=list)
     # NULL means "use the service ceiling". A config may lower these; the
     # service-wide values in app/config.py are the ceiling it cannot raise, which
     # is enforced where the runner is built, not here — a config edited before a
@@ -77,11 +83,12 @@ class AgentConfigIn(BaseModel):
 class AgentConfigPatch(BaseModel):
     """A partial update. Every field optional; ``None`` means "leave alone"."""
 
+    model_config = ConfigDict(extra="forbid")
+
     slug: str | None = Field(default=None, pattern=_SLUG)
     name: str | None = None
     system_prompt: str | None = None
     model_tier: str | None = None
-    mcp_servers: list[str] | None = None
     max_steps: int | None = Field(default=None, ge=1, le=50)
     max_cost_usd: float | None = Field(default=None, gt=0)
 
@@ -97,49 +104,26 @@ class AgentConfigOut(BaseModel):
     name: str
     system_prompt: str
     model_tier: str
-    mcp_servers: list[str]
-    oauth_connections: list[str]
+    # Ids, in broker order. The connections themselves are read from
+    # /admin/agents/{id}/connections — this list is what an agent *has*, not a
+    # second copy of what each one *is*.
+    connections: list[str]
     max_steps: int | None
     max_cost_usd: float | None
     created_at: str
     updated_at: str
 
 
-def _warn_unknown_peers(names: list[str]) -> None:
-    """Log peers Bloom cannot currently resolve. Advisory only — see the docstring.
-
-    Imported lazily: `agent_mcp.registry` reads a process-wide registry that is
-    only populated once the MCP server's lifespan has run, and a config edit must
-    not depend on that having happened.
-    """
-    if not names:
-        return
-    try:
-        from agent_mcp.registry import known_peers
-
-        unknown = [n for n in names if n not in set(known_peers())]
-    except Exception:  # noqa: BLE001 — discovery is advisory; never fail an edit on it
-        logger.debug("Peer check skipped: registry unavailable")
-        return
-    if unknown:
-        logger.warning(
-            "Config names peer(s) not currently registered: %s. This is allowed — "
-            "a peer may register later — but a run will skip them until it does.",
-            ", ".join(unknown),
-        )
-
-
 async def _out(store: Store, row: dict) -> AgentConfigOut:
-    """Project a stored row into the wire shape, filling in its bindings."""
-    bound = await asyncio.to_thread(store.connection_ids_for, row["id"])
-    return AgentConfigOut(**row, oauth_connections=bound)
+    """Project a stored row into the wire shape, filling in its attachments."""
+    attached = await asyncio.to_thread(store.connection_ids_for, row["id"])
+    return AgentConfigOut(**row, connections=attached)
 
 
 @router.post("", response_model=AgentConfigOut, status_code=201)
 async def create_agent(body: AgentConfigIn) -> AgentConfigOut:
-    """Define a new agent."""
+    """Define a new agent. Connections are attached afterwards, not here."""
     store = get_store()
-    _warn_unknown_peers(body.mcp_servers)
     try:
         row = await asyncio.to_thread(
             store.create_config,
@@ -147,7 +131,6 @@ async def create_agent(body: AgentConfigIn) -> AgentConfigOut:
             name=body.name or body.slug,
             system_prompt=body.system_prompt,
             model_tier=body.model_tier,
-            mcp_servers=body.mcp_servers,
             max_steps=body.max_steps,
             max_cost_usd=body.max_cost_usd,
         )
@@ -177,8 +160,6 @@ async def get_agent(config_id: str) -> AgentConfigOut:
 @router.patch("/{config_id}", response_model=AgentConfigOut)
 async def update_agent(config_id: str, body: AgentConfigPatch) -> AgentConfigOut:
     store = get_store()
-    if body.mcp_servers is not None:
-        _warn_unknown_peers(body.mcp_servers)
     try:
         row = await asyncio.to_thread(
             store.update_config, config_id, **body.model_dump(exclude_unset=True)
@@ -192,10 +173,12 @@ async def update_agent(config_id: str, body: AgentConfigPatch) -> AgentConfigOut
 
 @router.delete("/{config_id}", status_code=204)
 async def delete_agent(config_id: str) -> None:
-    """Delete a config, its bindings, and any OAuth connection it owns.
+    """Delete a config and its attachments. **Its connections survive.**
 
-    Connections marked shared (no owning config) survive deliberately — see
-    `app.db.Store.delete_config`.
+    A connection is a library entry, not a possession of whichever agent created
+    it: deleting an agent must not revoke a credential another agent is using, or
+    one you would only have to authorise again. This is the exact inverse of what
+    this route used to do — see `app.db.Store.delete_config`.
     """
     store = get_store()
     if not await asyncio.to_thread(store.delete_config, config_id):

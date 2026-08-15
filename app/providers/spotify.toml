@@ -17,9 +17,20 @@ api_base = "https://api.spotify.com/v1"
 client_id_env = "BLOOM_OAUTH_SPOTIFY_CLIENT_ID"
 client_secret_env = "BLOOM_OAUTH_SPOTIFY_CLIENT_SECRET"
 
+# How a connection to this provider holds its credential. Spotify's API has no
+# static-key mode, so the only option is a grant. Omitting this key means the same
+# thing; it is written out here because the alternative now exists.
+auth = "oauth"
+
 # Spotify supports PKCE and returns a rotating refresh token on the PKCE flow.
 pkce = true
 refresh_rotates = true
+
+# What "Test connection" calls: cheap, read-only, and needs no arguments. Its 200
+# proves the stored credential is live in a way that decrypting it cannot.
+[probe]
+method = "GET"
+path = "/me"
 
 # How the client credentials are presented at the token endpoint. Spotify accepts
 # HTTP Basic; some providers only accept them in the form body.
