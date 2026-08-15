@@ -1,0 +1,81 @@
+# Spotify — the worked example of a provider manifest.
+#
+# Adding a provider means adding a file like this one. No Python changes, no new
+# tools to register: `app/providers/registry.py` turns each [[operations]] entry
+# into a tool the model can call, with this file's descriptions as the only thing
+# it sees.
+#
+# Client credentials are NOT here. They are named here and read from the process
+# environment, so this file stays committable.
+
+name = "spotify"
+display_name = "Spotify"
+authorize_url = "https://accounts.spotify.com/authorize"
+token_url = "https://accounts.spotify.com/api/token"
+api_base = "https://api.spotify.com/v1"
+
+client_id_env = "BLOOM_OAUTH_SPOTIFY_CLIENT_ID"
+client_secret_env = "BLOOM_OAUTH_SPOTIFY_CLIENT_SECRET"
+
+# Spotify supports PKCE and returns a rotating refresh token on the PKCE flow.
+pkce = true
+refresh_rotates = true
+
+# How the client credentials are presented at the token endpoint. Spotify accepts
+# HTTP Basic; some providers only accept them in the form body.
+auth_style = "basic"
+
+scopes_default = [
+    "user-read-playback-state",
+    "user-modify-playback-state",
+    "user-read-currently-playing",
+    "playlist-read-private",
+]
+
+docs_url = "https://developer.spotify.com/documentation/web-api"
+
+[[operations]]
+name = "search"
+method = "GET"
+path = "/search"
+read_only = true
+scopes = []
+description = """Search Spotify's catalogue. Returns JSON with .tracks.items[], each
+carrying .name, .uri and .artists[].name. Pass a returned uri (of the form
+spotify:track:...) to spotify_play."""
+[operations.params]
+q = { in = "query", type = "string", required = true, description = "Search terms, e.g. 'artist:Radiohead Creep'." }
+type = { in = "query", type = "string", required = true, enum = ["track", "album", "artist", "playlist"] }
+limit = { in = "query", type = "integer", default = 10, description = "1-50." }
+
+[[operations]]
+name = "now_playing"
+method = "GET"
+path = "/me/player/currently-playing"
+read_only = true
+scopes = ["user-read-currently-playing"]
+description = """What is playing right now. Returns .item.name, .item.artists[].name
+and .is_playing. An empty body means nothing is playing."""
+[operations.params]
+
+[[operations]]
+name = "play"
+method = "PUT"
+path = "/me/player/play"
+read_only = false
+scopes = ["user-modify-playback-state"]
+description = """Start or resume playback on the user's active device. Pass `uris` to
+play specific tracks, or omit everything to resume what is already queued. Fails with
+404 if no device is active — tell the user to open Spotify somewhere."""
+[operations.params]
+uris = { in = "body", type = "array", items = "string", description = "Track URIs, e.g. ['spotify:track:...']." }
+device_id = { in = "query", type = "string", description = "Optional; defaults to the active device." }
+
+[[operations]]
+name = "pause"
+method = "PUT"
+path = "/me/player/pause"
+read_only = false
+scopes = ["user-modify-playback-state"]
+description = "Pause playback on the user's active device."
+[operations.params]

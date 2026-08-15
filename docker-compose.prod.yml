@@ -1,0 +1,45 @@
+# Production overlay. Applied on top of docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Compose merges rather than replaces, so everything here is a deliberate
+# difference from development.
+
+services:
+  app:
+    build:
+      dockerfile: docker/Dockerfile
+    # Pinned tag, never `latest` — otherwise a restart silently changes the
+    # running code and there is nothing to roll back to. Watchtower moves this
+    # forward; set it to the tag your CI publishes.
+    image: ghcr.io/johonnyy/bloom:0.1.0
+    # `!override` replaces the dev list rather than merging into it. Without it
+    # Compose keeps the development bind mount of the host checkout over /srv,
+    # and production silently runs whatever source happens to be on the server
+    # instead of the code baked into the pinned image.
+    volumes: !override
+      - bloom_data:/srv/data
+    environment:
+      BLOOM_DB_PATH: /srv/data/bloom.db
+    # The dev command carries --reload, which must not survive into production —
+    # it watches the source tree that the volume override just removed.
+    command: !override
+      ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8010"]
+    # Bound to loopback only. Caddy runs with network_mode: host on these boxes
+    # and proxies to 127.0.0.1:<port>, so every app publishes on loopback and a
+    # firewall slip cannot expose one past TLS. See amber-infra/README.md.
+    ports: !override
+      - "127.0.0.1:8010:8010"
+    labels:
+      # Watchtower is the initial auto-update mechanism; core services migrate to
+      # webhook deploys once timing needs to be controlled more tightly.
+      com.centurylinklabs.watchtower.enable: "true"
+    healthcheck:
+      # Deep, unlike the image's own shallow HEALTHCHECK: on this box the answer
+      # that matters is whether the database opened, since a Bloom that cannot
+      # read its configs has nothing to serve.
+      test: ["CMD-SHELL", "curl -fsS 'http://127.0.0.1:8010/health?deep=true' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped

@@ -1,0 +1,197 @@
+# Bloom ↔ Aperture integration contract
+
+What Bloom's management API offers, and what Aperture has to build to use it.
+
+## Read this first: none of the Aperture side exists yet
+
+This document describes work to be done in the Aperture repo, not a capability it
+has. As of writing:
+
+- **Aperture has no HTTP client of any kind.** It reaches backends two ways: one
+  WebSocket to Amber (`src/main/amber/connection.ts`) and SSH (`src/main/infra/`).
+  A `fetch`-based client layer is net-new.
+- **Aperture has no `aperture://` protocol handler.** Nothing calls
+  `setAsDefaultProtocolClient`, and the `aperture:` string in `src/shared/ipc.ts`
+  is an IPC channel prefix, not a URL scheme.
+
+Bloom's side of both is finished and working. The OAuth completion page already
+fires the deep link *and* renders "you can close this tab", so the flow is usable
+today and gets better — with no server change — the day the handler is registered.
+
+## Connection basics
+
+| | |
+|---|---|
+| Base URL | user-entered, like `Settings.amberUrl` already is. There is no discovery for this. |
+| Auth | `Authorization: Bearer <BLOOM_ADMIN_KEYS token>` on every `/admin` route except the OAuth callback |
+| Errors | always `{"error": "<code>", "message": "<prose>"}` — never FastAPI's `{"detail"}` |
+| Error codes | `bad_request` `unauthorized` `forbidden` `not_found` `conflict` `unprocessable` `unavailable` |
+| Schema | `docs/openapi.json`, checked in and CI-verified current. Generate a client from it. |
+
+**The admin key is not the MCP key.** `BLOOM_ADMIN_KEYS` and `BLOOM_MCP_KEYS` are
+separate on purpose: Aperture edits configuration, a peer agent spends money, and
+one leaked token should not buy both. Aperture must never be given an MCP key.
+
+## Agent builder — `/admin/agents`
+
+```
+POST   /admin/agents            create           201 → AgentConfig
+GET    /admin/agents            list             200 → AgentConfig[]  (newest first)
+GET    /admin/agents/{id}                        200 → AgentConfig
+PATCH  /admin/agents/{id}       partial update   200 → AgentConfig
+DELETE /admin/agents/{id}                        204
+```
+
+```jsonc
+// AgentConfig
+{
+  "id": "842a050b9d35…",           // uuid4 hex, URL-safe unquoted
+  "slug": "spotify-dj",            // ^[a-z][a-z0-9-]{0,63}$ — how a caller names it
+  "name": "Spotify DJ",
+  "system_prompt": "You pick music.",
+  "model_tier": "balanced",        // cheap | balanced | strong, or a literal vendor/model
+  "mcp_servers": ["amber"],        // peer names, resolved via the sync store
+  "oauth_connections": ["…"],      // connection ids, from the binding table
+  "max_steps": null,               // null = use the service ceiling
+  "max_cost_usd": null,
+  "created_at": "…", "updated_at": "…"
+}
+```
+
+Two validation behaviours worth building UI around:
+
+- **`model_tier` is rejected at edit time** (422) if it is neither a known tier nor
+  a literal `vendor/model`. Show the message; it names what was wrong.
+- **`mcp_servers` is *not* validated.** Naming a peer that has not registered yet is
+  allowed — a config may legitimately precede its peer — and the run silently skips
+  unresolvable ones. If Aperture wants to warn, cross-reference the sync store; do
+  not treat it as an error.
+- A duplicate `slug` is `409 conflict`.
+- **Ceilings clamp, they never raise.** A config may lower `max_steps` /
+  `max_cost_usd` below the service values; a higher number is silently clamped
+  down at run time rather than rejected. Present them as "at most".
+
+## Test-run panel
+
+```
+POST /admin/agents/{id}/test-run     {"input": "…"}   202 → {run_id, status, stream_url, trace_url}
+GET  /admin/runs/{run_id}/events                      200 text/event-stream
+GET  /admin/agents/{id}/runs/{run_id}/trace           200 → {run, events[]}
+GET  /admin/agents/{id}/runs?limit=&offset=           200 → run[]
+```
+
+`POST` answers **immediately with the id** and runs in the background. That is the
+whole reason it is 202: a synchronous call could not hand you an id before the run
+ended, so there would be nothing to attach a live panel to. The intended sequence
+is POST → read `stream_url` → open the stream. There is no race: the stream replays
+from the beginning of the log before tailing, so connecting late loses nothing.
+
+`503 unavailable` means no `BLOOM_OPENROUTER_API_KEY` is configured — worth showing
+as a setup prompt rather than an error.
+
+### The event stream
+
+Server-sent events. Each carries `id:` (a monotonic integer) and `event:` (the
+kind). On reconnect the browser's `EventSource` sends `Last-Event-ID` automatically
+and the stream resumes exactly where it stopped; a hand-rolled client should do the
+same, or pass `?after=<id>`. A `: ping` comment arrives every 15s.
+
+| `event:` | fields | meaning |
+|---|---|---|
+| `run_started` | `payload.agent_slug`, `payload.origin`, `payload.model_tier` | the run began |
+| `text` | `payload.text` | one completed **sentence** of the answer |
+| `tool_started` | `tool_name`, `payload.args` | a tool is about to run |
+| `tool_finished` | `tool_name`, `ok`, `latency_ms`, `payload.result` | and its outcome |
+| `step_finished` | `step_index`, `tokens_in`, `tokens_out`, `cost_usd`, `payload.model` | per-step accounting |
+| `run_finished` | `ok`, `cost_usd`, `payload.status`, `payload.stopped_by`, `payload.error` | **terminal — the stream closes** |
+
+**Be honest in the UI about what is live.** Text arrives at *sentence* granularity,
+not token by token — the underlying runtime exposes no token callback that also
+records cost, and Bloom will not trade the cost ledger for a smoother cursor. Tool
+events are genuinely live. `step_finished` rows all arrive at the end, together,
+because that is when the runtime makes them available. Rendering them as if they
+streamed would be a lie the user notices.
+
+`payload.status` is one of `succeeded | failed | cancelled | abandoned`.
+`abandoned` means the process running it restarted. When `payload.stopped_by`
+names a stop condition, **the answer is truncated** — the run hit its step or cost
+ceiling — and should be labelled as such, not shown as a finished reply.
+
+`/trace` returns the same records as a list, so one renderer serves both the live
+panel and the history view. It 404s if the run does not belong to that agent.
+
+### One accounting caveat to surface
+
+When a run stops on a ceiling, the underlying runtime makes one further completion
+that it does not report. So a stopped run's `cost_usd` **under-reports by exactly
+one model call**. This is upstream behaviour in `agent-runtime`, not a Bloom bug;
+if the number is presented as authoritative, say "at least".
+
+## Connected accounts
+
+```
+GET    /admin/oauth/providers                                200 → provider[]
+GET    /admin/agents/{id}/oauth                              200 → connection[]
+POST   /admin/agents/{id}/oauth/{provider}/start  {"scopes"?} 200 → {authorize_url, state, expires_at, scopes, redirect_uri}
+DELETE /admin/agents/{id}/oauth/{provider}                   204
+GET    /admin/oauth/{provider}/callback                      *** no auth — the browser lands here ***
+```
+
+`providers[].configured` distinguishes "Bloom ships a manifest for this" from
+"this deployment has client credentials". Grey out a Connect button on
+`configured: false` and say why; the flow would otherwise fail at the redirect.
+
+`connection[]` carries `provider`, `status`, `scopes`, `expires_at`,
+`last_used_at`, `shared`. **It never carries a token value, and never will.**
+`status` is `pending | active | expired | needs_reauth | revoked`; anything but
+`active` means the agent cannot use that provider and is told so in its prompt.
+
+`503 unavailable` from `/start` means OAuth is not configured on the server
+(`BLOOM_FEATURE_OAUTH`, `BLOOM_FERNET_KEYS`, `BLOOM_PUBLIC_URL`). Storing a token
+without an encryption key is refused rather than downgraded.
+
+### The browser handoff
+
+1. User clicks **Connect Spotify** on an agent.
+2. Aperture `POST`s `/oauth/spotify/start` and gets `authorize_url`.
+3. Aperture opens it with `shell.openExternal` (not a `BrowserWindow` — providers
+   increasingly refuse embedded webviews, and the system browser has the user's
+   existing session).
+4. User approves. The provider redirects to
+   `https://<bloom>/admin/oauth/spotify/callback?code=…&state=…`.
+5. Bloom exchanges the code, encrypts and stores the tokens, binds the connection,
+   and serves a page that redirects to:
+
+   ```
+   aperture://oauth-complete?provider=spotify&status=success
+   ```
+
+   `status` is `success` or `error`. The page also renders human-readable text, so
+   it works before step 6 exists.
+6. **To be built in Aperture:** register the scheme and handle the deep link.
+
+   ```ts
+   app.setAsDefaultProtocolClient('aperture')          // once, at startup
+   app.on('open-url', handle)                          // macOS
+   app.on('second-instance', (_e, argv) => handle(argv.find(a => a.startsWith('aperture://'))))
+   ```
+
+   Windows and Linux deliver the URL as an argv entry to a *second* instance, so
+   `requestSingleInstanceLock()` is required or the deep link silently opens a new
+   copy of the app instead of reaching the running one. On the event: focus the
+   window, and re-fetch `/admin/agents/{id}/oauth` — do not trust the URL's
+   `status` as the source of truth, since the server already recorded the outcome.
+
+The state is single-use and expires in 10 minutes; a replayed callback answers 400
+with a page telling the user to start again.
+
+## Suggested build order in Aperture
+
+1. A small `fetch` client with base URL + bearer from settings, and one place that
+   converts `{error, message}` into a thrown typed error. Everything else needs it.
+2. Agent builder CRUD. Usable on its own, and the fastest way to prove the client.
+3. Run history — a plain list, reusing the audit-log pattern from the SSH tab.
+4. Test-run + live trace. `EventSource` gets `Last-Event-ID` resumption free; the
+   renderer is the one the history view already needs.
+5. The protocol handler and OAuth buttons last, since the server side degrades
+   gracefully until then.

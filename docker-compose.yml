@@ -1,0 +1,42 @@
+# Local development stack: the app with hot reload. That is the whole stack.
+#
+# There is no database service. Bloom stores everything in one SQLite file, the
+# ecosystem's house pattern — the same choice Amber and sync-store made, and the
+# reason `pytest` and `docker compose up` both work on a fresh clone with nothing
+# else installed. The file is co-tenanted by three writers (Bloom's tables,
+# agent_mcp's tool log, agent_runtime's cost rows), which is why it lives on a
+# named volume rather than in the bind-mounted source tree: WAL puts `-wal` and
+# `-shm` sidecars next to it, and those do not survive a host filesystem shared
+# with a container cleanly.
+#
+# Production overlays this file rather than replacing it:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dev
+    env_file: .env
+    environment:
+      # Overrides .env: inside the container the database lives on the volume
+      # below, not in the working directory. Compose merges this on top, so a
+      # developer's .env needs no Docker-specific edit that would then break
+      # their local uvicorn.
+      BLOOM_DB_PATH: /srv/data/bloom.db
+    ports:
+      - "8010:8010"
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8010", "--reload"]
+    volumes:
+      # Source bind mount: this is what makes --reload useful.
+      - .:/srv
+      # Anonymous volume so the image's installed package metadata is not
+      # shadowed by the host checkout.
+      - /srv/app.egg-info
+      # Everything Bloom knows. Without this it dies with the container — and
+      # unlike a cache, that includes every configured agent and OAuth grant.
+      - bloom_data:/srv/data
+    restart: unless-stopped
+
+volumes:
+  bloom_data:

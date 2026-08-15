@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  # A new push supersedes the run in flight for the same ref.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the floor the whole ecosystem targets; 3.12 catches
+        # deprecations before an upgrade forces the issue.
+        python-version: ["3.11", "3.12"]
+
+    # No service containers. Bloom's only datastore is a SQLite file it creates
+    # itself, so the suite needs nothing running — which is also the reason a
+    # contributor can clone and `pytest` with no setup step.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        # agent-mcp-py and agent-runtime are git URLs pinned by commit SHA, so
+        # the runner needs git — it has it, but a self-hosted runner might not.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Test
+        # Deliberately no environment: every test builds its own settings with
+        # `_env_file=None`, so a variable set here would prove nothing about how
+        # the service actually boots.
+        run: pytest -q
+
+      - name: The committed OpenAPI schema is current
+        # Aperture generates its client from docs/openapi.json without running
+        # the service, so a stale file is a client that silently disagrees with
+        # the server. Regenerate with `make openapi`.
+        run: |
+          python -m app.openapi > /tmp/openapi.json
+          diff -u docs/openapi.json /tmp/openapi.json \
+            || { echo "::error::docs/openapi.json is stale — run 'make openapi'"; exit 1; }
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the production image
+        # Build only — publishing is a deploy concern and needs credentials this
+        # workflow deliberately does not have.
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          tags: bloom:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

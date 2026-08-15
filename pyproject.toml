@@ -1,0 +1,78 @@
+[project]
+name = "bloom"
+version = "0.1.0"
+description = "Bloom — define reusable agent configurations, and run them on behalf of other agents."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    # Settings. One prefix for the whole app — see app/config.py on why the
+    # embedded libraries are configured by injection rather than their own env.
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "python-dotenv>=1.0",
+    # The convention layer for Bloom's own MCP server — the execution surface
+    # other agents delegate through: bearer auth, the conversation-depth guard,
+    # per-call usage logging and sync-store registration all arrive with the
+    # decorators. Pinned by commit SHA rather than tag because the repo is not
+    # tagged yet — switch to @v0.1.0 when it is.
+    "agent-mcp-py @ git+https://github.com/Johonnyy/agent-mcp-py@793a449",
+    # The agentic loop itself. The template leaves this commented out because
+    # most apps publish tools and let someone else do the thinking; Bloom *is*
+    # that someone else, so it is the one app that must embed the runtime. The
+    # [mcp] extra lets a configured agent call peer servers as a client.
+    "agent-runtime[mcp] @ git+https://github.com/Johonnyy/agent-runtime@8bd6ae6",
+    # Token encryption at rest (Fernet / MultiFernet). See app/crypto.py.
+    "cryptography>=43.0",
+    # NOT httpx. mcp v2 ships httpx2 as a separate distribution with a separate
+    # top-level module, and agent-mcp-py/agent-runtime both import that one. A
+    # second HTTP client for the OAuth exchange would mean two connection pools
+    # and two sets of timeout semantics, so Bloom uses the one already here.
+    "httpx2>=2.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    # TestClient's transport. FastAPI's TestClient still wants httpx proper,
+    # which is why it appears here and httpx2 appears above — they are different
+    # packages, and this one is dev-only.
+    "httpx>=0.27",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+# Flat layout: this is an app, not a distributable library. The sibling
+# libraries (agent-mcp-py, agent-runtime) use src/ for that reason; apps do not.
+include = ["app*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+# No sibling repo carries lint config yet — this is a new introduction, and
+# deleting the section is harmless if you disagree with it. CI runs it because a
+# template with a lint job and nothing to lint is worse than either alternative.
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4"]
+
+[tool.ruff.lint.flake8-bugbear]
+# `def handler(x = Depends(...))` is how FastAPI declares dependencies — the
+# call in the default is the entire mechanism, not the mutable-default bug B008
+# exists to catch.
+extend-immutable-calls = [
+    "fastapi.Body",
+    "fastapi.Depends",
+    "fastapi.Header",
+    "fastapi.Path",
+    "fastapi.Query",
+]

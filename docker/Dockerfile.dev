@@ -1,0 +1,26 @@
+# Development image: single stage, source bind-mounted, hot reload.
+#
+# Deliberately not multi-stage. The source is mounted over /srv at run time, so
+# a build-time copy would be thrown away, and running as root avoids the
+# uid-mismatch permission fight that bind mounts cause on Linux hosts.
+FROM python:3.11.13-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y git build-essential curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /srv
+
+# Installed editable against the metadata only, so the bind mount supplies the
+# actual source and an edit does not need a rebuild.
+COPY pyproject.toml ./
+COPY app/__init__.py ./app/
+RUN pip install -e ".[dev]"
+
+EXPOSE 8010
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8010", "--reload"]
