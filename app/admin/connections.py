@@ -35,12 +35,12 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.admin.deps import require_admin
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.credentials import CredentialResolver, client_credentials
 from app.crypto import encrypt
 from app.db import ConnectionNameTaken, Store, get_store
 from app.errors import ApiError
-from app.oauth.flow import OAuthError, start
+from app.oauth.flow import OAuthError, redirect_uri, start
 from app.providers import Provider, get_provider, providers, registry
 
 logger = logging.getLogger(__name__)
@@ -325,6 +325,16 @@ async def connection_kinds() -> dict:
     a provider. It is a hint that lets the create form prefill — not a gate: a
     connection may bring its own, which is what makes connecting an account
     something a user can do rather than a deployment operation.
+
+    ``redirect_uri`` is the other half of that. Registering an app at the provider
+    requires pasting Bloom's callback address into their console, byte for byte — it
+    is compared exactly, at both the authorize step and the token exchange — and it
+    was previously discoverable only by reading `flow.redirect_uri` or by succeeding
+    at a flow that cannot succeed until it is registered. Reporting it here is what
+    lets a UI show the string to copy *before* anything is attempted. ``public_url``
+    rides alongside so a client can tell "this provider has no browser flow" from
+    "this deployment has no callback address", which are one blank field and one
+    server misconfiguration.
     """
     settings = get_settings()
     reason = (
@@ -333,6 +343,7 @@ async def connection_kinds() -> dict:
         else "Set BLOOM_FEATURE_OAUTH=true and BLOOM_FERNET_KEYS to store credentials."
     )
     return {
+        "public_url": settings.public_url,
         "kinds": [
             # A peer with no token needs no encryption key, so it stays available:
             # there is no secret to store badly.
@@ -346,6 +357,7 @@ async def connection_kinds() -> dict:
                 "display_name": p.display_name,
                 "auth": list(p.auth_methods),
                 "has_deployment_default": p.has_deployment_default,
+                "redirect_uri": _callback_for(p, settings),
                 "client_id_env": p.client_id_env,
                 "client_secret_env": p.client_secret_env,
                 "scopes_default": list(p.scopes_default),
@@ -361,6 +373,23 @@ async def connection_kinds() -> dict:
         ],
         "discovered_peers": _discovered_peers(),
     }
+
+
+def _callback_for(provider: Provider, settings: Settings) -> str:
+    """The address to register with this provider, or '' when there is none to give.
+
+    Empty for two different reasons, both of which the caller can tell apart from
+    ``public_url``: a provider with no browser flow has no callback at all, and a
+    deployment with no ``BLOOM_PUBLIC_URL`` has nowhere to send one. Reported rather
+    than raised — listing what this build offers must not fail because one provider
+    cannot currently be used.
+    """
+    if "oauth" not in provider.auth_methods:
+        return ""
+    try:
+        return redirect_uri(provider.name, settings)
+    except OAuthError:
+        return ""
 
 
 def _discovered_peers() -> list[dict]:

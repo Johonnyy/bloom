@@ -296,6 +296,30 @@ bug, and stored it would be indistinguishable from a real credential. Client
 credentials on a non-`oauth` connection are `422` too — a peer's bearer token is
 `secret`.
 
+### The redirect URI is Bloom's, and it must be registered first
+
+`/admin/connections/kinds` reports `redirect_uri` per provider and `public_url` at
+the top level:
+
+```
+https://<BLOOM_PUBLIC_URL>/admin/oauth/<provider>/callback
+```
+
+One route, `{provider_name}` templated, so a new provider needs no new route — only
+a manifest. **Show it and let the user copy it; never rebuild it client-side.** It is
+compared byte for byte, at the authorize step *and* again at the token exchange, so a
+trailing slash or an `http` for an `https` fails at the last hop of a flow that looked
+like it was working. Most providers also require `https` for anything that is not
+loopback, and Spotify additionally refuses `localhost` in favour of `127.0.0.1` — all
+of which the deployment's real public origin satisfies and a guess may not.
+
+This is why Bloom hosts the callback rather than Aperture: the redirect target has to
+be a stable public address registered in advance, and a desktop app has neither.
+
+Both fields are `""` when this deployment has no `BLOOM_PUBLIC_URL`. That is worth
+reporting as its own sentence — no browser flow can start at all — and `public_url`
+is what distinguishes it from a provider that simply has no OAuth flow.
+
 ### The browser handoff
 
 1. `POST /admin/connections` `{kind: "oauth", provider: "spotify", client_id, client_secret}`

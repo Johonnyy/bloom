@@ -430,6 +430,45 @@ def test_an_empty_client_id_falls_back_to_the_deployment_default(client):
     assert "empty" in refused.json()["message"]
 
 
+def test_kinds_reports_the_callback_to_register_with_each_provider(client):
+    """The string a person pastes into a developer console, byte for byte.
+
+    Providers compare it exactly, at both the authorize step and the token exchange,
+    so it cannot be reconstructed by a client guessing at Bloom's route shape.
+    """
+    body = client.get("/admin/connections/kinds", headers=AUTH).json()
+    assert body["public_url"] == "https://bloom.example"
+
+    spotify = next(p for p in body["providers"] if p["name"] == "spotify")
+    assert spotify["redirect_uri"] == "https://bloom.example/admin/oauth/spotify/callback"
+
+    # And it is exactly what a started flow will send, which is the property that
+    # matters — two nearly-identical strings is the failure this is meant to prevent.
+    connection = client.post(
+        "/admin/connections",
+        headers=AUTH,
+        json={"kind": "oauth", "provider": "spotify", "client_id": "a", "client_secret": "b"},
+    ).json()
+    started = client.post(
+        f"/admin/connections/{connection['id']}/oauth/start", headers=AUTH, json={}
+    ).json()
+    assert started["redirect_uri"] == spotify["redirect_uri"]
+
+
+def test_a_deployment_with_no_public_url_reports_no_callback(client, monkeypatch):
+    """Blank, not an exception: listing what this build offers must still work.
+
+    Two different blanks, told apart by `public_url` — a provider with no browser
+    flow has no callback at all, and this has nowhere to send one.
+    """
+    monkeypatch.setenv("BLOOM_PUBLIC_URL", "")
+    get_settings.cache_clear()
+
+    body = client.get("/admin/connections/kinds", headers=AUTH).json()
+    assert body["public_url"] == ""
+    assert all(p["redirect_uri"] == "" for p in body["providers"])
+
+
 def test_client_credentials_are_refused_on_a_peer(client):
     """A peer has no app registration; its bearer token is `secret`."""
     peer = _peer(client)
