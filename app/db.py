@@ -40,23 +40,29 @@ Storage decisions worth the words:
   needs the bytes asks for them by a method that says so. Note that sync-store's
   equivalent *does* return its ``token`` — that is a peer credential an admin sets,
   not a user's grant, and the shape should not be copied here.
-* **There is no migration runner, and this file will refuse a database written
-  before connections existed.** Bloom has never been deployed, so the honest
-  handling of an old dev database is to say what it is and where the delete button
-  is — see :class:`SchemaTooOld`.
+* **There is a migration runner, because Bloom is deployed.** ``bloom_schema_version``
+  plus an ordered ``_MIGRATIONS`` tuple, applied at :class:`Store` construction. A
+  table rather than ``PRAGMA user_version`` for the same reason Amber's store uses
+  one: that pragma is a single file-wide slot and this file has three tenants. See
+  :func:`_migrate_to_connections` for what the first one moves and why.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import threading
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from app.config import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -83,45 +89,245 @@ class ConnectionNameTaken(ValueError):
         self.name = name
 
 
-class SchemaTooOld(RuntimeError):
-    """The database predates connections and cannot be read.
+# --- migrations ---------------------------------------------------------------
+#
+# 0.2.0 shipped a guard here instead of a migration, on the stated reasoning that
+# "Bloom has never been deployed, so there is nothing to preserve". It had been.
+# `CREATE TABLE IF NOT EXISTS` leaves an old file untouched, so every 0.1.0 install
+# hit the guard, raised at `Store` construction inside the lifespan, and crash-looped
+# with `unhealthy` as the only symptom. A guard that assumes no deployments is a
+# guard with a shelf life; carrying the data across does not expire.
+#
+# The version lives in a table rather than `PRAGMA user_version` because that pragma
+# is a single file-wide slot and this file has three tenants (see the module
+# docstring). `amber_v2/app/memory/store.py` reached the same conclusion for the
+# same reason. A database written before this table existed reports 0, which is
+# also what a brand-new one reports — so every migration below must be a no-op
+# against a fresh file, and detects that for itself rather than trusting the number.
 
-    Raised at :class:`Store` construction rather than from whichever route first
-    hits a missing column, for the same reason `app.crypto.assert_usable` runs in
-    the lifespan: a configuration problem should fail next to the configuration,
-    at boot, with the fix in the message.
+# The tool-namespace rule from `app/admin/connections.py`, applied to names this
+# module synthesises rather than to names a user typed. A separate copy on purpose:
+# importing a router into the storage layer to borrow one constant would invert the
+# dependency.
+_NAME_OK = re.compile(r"^[a-z][a-z0-9_-]{0,23}$")
 
-    Bloom has never been deployed, so there is nothing to preserve and no migration
-    to write. The only databases that can be in this state are development ones.
+
+def _unique_name(raw: str, taken: set[str]) -> str:
+    """A namespace-safe connection name derived from ``raw``, unique within ``taken``.
+
+    ``taken`` is mutated, so successive calls in one migration cannot collide with
+    each other — the column is UNIQUE, and two providers of the same name in a
+    0.1.0 file is an ordinary state, not a corrupt one.
     """
+    base = re.sub(r"[^a-z0-9_-]+", "-", raw.strip().lower()).strip("-")[:24]
+    if not base or not _NAME_OK.match(base):
+        # Anything the rule rejects for a reason other than length: a leading digit,
+        # a name that sanitised down to nothing. Prefixed rather than dropped, so the
+        # row still says which peer or provider it came from.
+        base = f"c-{base}"[:24] if base else "connection"
+    name, n = base, 2
+    while name in taken:
+        suffix = f"-{n}"
+        name = f"{base[: 24 - len(suffix)]}{suffix}"
+        n += 1
+    taken.add(name)
+    return name
 
 
-def _reject_legacy_schema(conn: sqlite3.Connection, path: str) -> None:
-    """Refuse a database still shaped for ``mcp_servers`` and ``oauth_connections``.
+def _migrate_to_connections(conn: sqlite3.Connection, peers: dict[str, dict]) -> None:
+    """v1 — fold ``oauth_connections`` and ``mcp_servers_json`` into ``connections``.
 
-    ``CREATE TABLE IF NOT EXISTS`` is a no-op against an existing table, so without
-    this an old file loads happily and then fails deep inside a route: ``SELECT *``
-    hands ``_config_row`` an ``mcp_servers_json`` column, which reaches a pydantic
-    model that has never heard of it.
+    An agent's reach used to be two half-things: a list of bare peer names on the
+    config row, and a set of OAuth rows that named the config as their owner. Both
+    now mean one thing — a row in ``connections``, attached through
+    ``agent_connections`` — and this moves the data without losing an edge.
+
+    Three decisions worth stating:
+
+    * **Ids are preserved.** A credential keeps the id it was stored under, so
+      nothing that already references one has to be rewritten, and re-running this
+      after a crash re-derives the same rows instead of duplicating them. Every
+      write here is ``INSERT OR IGNORE`` against that id for the same reason.
+    * **Ownership and binding are unioned.** ``oauth_connections.agent_config_id``
+      recorded ownership and ``agent_config_oauth`` recorded use. Both answer
+      "may this agent act through this credential", which is exactly what the new
+      edge means, so both become edges.
+    * **A peer with no URL still becomes a connection.** ``mcp_servers_json`` held
+      names the shared registry resolved; a connection carries its own URL, and the
+      only place those names were configured is ``BLOOM_MCP_PEERS`` — passed in,
+      because storage neither reads settings nor holds the key that encrypts a
+      bearer. An unresolvable name lands ``pending`` with an empty URL, which
+      ``_peer_resolver`` skips with a warning and Aperture shows as a row with a
+      field to fill in. Dropping it would erase the only record that the agent was
+      ever wired to that peer.
     """
-    legacy_tables = {
-        row["name"]
-        for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name IN ('oauth_connections', 'agent_config_oauth')"
-        )
+    tables = {
+        row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
-    columns = {row["name"] for row in conn.execute("PRAGMA table_info(agent_configs)")}
-    if not legacy_tables and "mcp_servers_json" not in columns:
-        return
-    found = ", ".join(sorted(legacy_tables | (columns & {"mcp_servers_json"})))
-    raise SchemaTooOld(
-        f"{path} was written before connections replaced mcp_servers and "
-        f"oauth_connections (found: {found}). "
-        "Bloom has never been deployed, so there is nothing to preserve: delete "
-        f"{path}, {path}-wal and {path}-shm, then start again. The agent_mcp_usage "
-        "and agent_runtime_usage logs share that file and will be recreated empty."
+    config_columns = {row["name"] for row in conn.execute("PRAGMA table_info(agent_configs)")}
+    had_credentials = "oauth_connections" in tables
+    had_peers = "mcp_servers_json" in config_columns
+    if not had_credentials and not had_peers and "agent_config_oauth" not in tables:
+        return  # a fresh database, or one already carried across
+
+    now = _now()
+    taken = {row["name"] for row in conn.execute("SELECT name FROM connections")}
+    known = {row["id"] for row in conn.execute("SELECT id FROM connections")}
+    bindings: dict[str, list[str]] = {}
+
+    def bind(agent_config_id: str, connection_id: str) -> None:
+        edges = bindings.setdefault(agent_config_id, [])
+        if connection_id not in edges:
+            edges.append(connection_id)
+
+    # 1. Credentials. `SELECT *` with `.get` defaults rather than named columns:
+    #    this has to read whatever a 0.1.x file actually holds, not what the last
+    #    version of that schema in git says it should.
+    credentials = 0
+    if had_credentials:
+        for row in conn.execute("SELECT * FROM oauth_connections"):
+            old = dict(row)
+            if old["id"] in known:
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO connections "
+                "(id, kind, provider, name, label, config_json, secret, refresh_token, "
+                " client_secret, expires_at, scopes_json, status, encrypted_at, "
+                " last_used_at, created_at, updated_at) "
+                "VALUES (?, 'oauth', ?, ?, '', '{}', ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    old["id"],
+                    # NOT NULL for every kind but `mcp`, and a 0.1.0 row could not
+                    # have been anything else.
+                    old.get("provider") or "unknown",
+                    _unique_name(old.get("provider") or "connection", taken),
+                    old.get("access_token"),
+                    old.get("refresh_token"),
+                    old.get("expires_at"),
+                    old.get("scopes_json") or "[]",
+                    old.get("status") or "pending",
+                    old.get("encrypted_at"),
+                    old.get("last_used_at"),
+                    old.get("created_at") or now,
+                    old.get("updated_at") or now,
+                ),
+            )
+            credentials += 1
+
+    # 2. Both kinds of edge.
+    if "agent_config_oauth" in tables:
+        for row in conn.execute(
+            "SELECT agent_config_id, oauth_connection_id FROM agent_config_oauth"
+        ):
+            bind(row["agent_config_id"], row["oauth_connection_id"])
+    if had_credentials:
+        for row in conn.execute(
+            "SELECT id, agent_config_id FROM oauth_connections "
+            "WHERE agent_config_id IS NOT NULL AND agent_config_id <> ''"
+        ):
+            bind(row["agent_config_id"], row["id"])
+
+    # 3. Peers, after the credentials, because broker order is observable and
+    #    credentials preceded peers before this change too.
+    peer_ids: dict[str, str] = {}
+    unresolved: list[str] = []
+    if had_peers:
+        for row in conn.execute("SELECT id, mcp_servers_json FROM agent_configs"):
+            for raw in _json_list(row["mcp_servers_json"]):
+                peer = str(raw).strip()
+                if not peer:
+                    continue
+                if peer not in peer_ids:
+                    url = str((peers.get(peer) or {}).get("url") or "").strip()
+                    if not url:
+                        unresolved.append(peer)
+                    peer_ids[peer] = new_id()
+                    conn.execute(
+                        "INSERT OR IGNORE INTO connections "
+                        "(id, kind, provider, name, label, config_json, secret, status, "
+                        " created_at, updated_at) "
+                        "VALUES (?, 'mcp', NULL, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            peer_ids[peer],
+                            _unique_name(peer, taken),
+                            peer,
+                            # No `endpoint` flag: these were ecosystem peers entered
+                            # as bare hosts, which is exactly `base_url` semantics.
+                            json.dumps({"url": url}),
+                            (peers.get(peer) or {}).get("secret"),
+                            "active" if url else "pending",
+                            now,
+                            now,
+                        ),
+                    )
+                bind(row["id"], peer_ids[peer])
+
+    for agent_config_id, edges in bindings.items():
+        for position, connection_id in enumerate(edges):
+            conn.execute(
+                "INSERT OR IGNORE INTO agent_connections "
+                "(agent_config_id, connection_id, position, created_at) VALUES (?,?,?,?)",
+                (agent_config_id, connection_id, position, now),
+            )
+
+    # 4. Retire the old shapes. `DROP COLUMN` needs SQLite >= 3.35 (2021); the
+    #    runtime image is bookworm's 3.40 and every Python 3.11 this project runs on
+    #    bundles later than that.
+    if had_peers:
+        conn.execute("ALTER TABLE agent_configs DROP COLUMN mcp_servers_json")
+    conn.execute("DROP TABLE IF EXISTS agent_config_oauth")
+    conn.execute("DROP TABLE IF EXISTS oauth_connections")
+    # `oauth_states` keyed a flow to an agent and now keys one to a connection, and
+    # `CREATE TABLE IF NOT EXISTS` cannot reshape a table that already exists.
+    # Dropped rather than carried: every row is single-use and expires in minutes,
+    # so the worst case is an authorize link opened before the update and finished
+    # after it, which fails cleanly and is retried by clicking Connect again.
+    if "oauth_states" in tables:
+        state_columns = {r["name"] for r in conn.execute("PRAGMA table_info(oauth_states)")}
+        if "connection_id" not in state_columns:
+            conn.execute("DROP TABLE oauth_states")
+    conn.commit()
+    # Puts back whatever was just dropped. Last, because `executescript` commits
+    # first: everything above is idempotent, so a crash before this line replays
+    # cleanly and there is nothing pending to lose.
+    conn.executescript(_SCHEMA)
+
+    logger.info(
+        "migrated %d credential(s) and %d peer(s) into connections", credentials, len(peer_ids)
     )
+    if unresolved:
+        logger.warning(
+            "no URL for MCP peer(s) %s — stored as `pending` and unusable until one is "
+            "set. They were resolved through the shared registry before this version; "
+            "set BLOOM_MCP_PEERS, or paste each URL in Aperture under Connections.",
+            ", ".join(sorted(set(unresolved))),
+        )
+
+
+# Ordered, and applied in order. Append; never renumber.
+_MIGRATIONS: tuple[tuple[int, str, Callable[[sqlite3.Connection, dict[str, dict]], None]], ...] = (
+    (1, "connections replace oauth_connections and mcp_servers", _migrate_to_connections),
+)
+
+
+def _apply_migrations(conn: sqlite3.Connection, path: str, peers: dict[str, dict]) -> None:
+    """Bring ``conn`` up to the current schema version, one step at a time."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS bloom_schema_version "
+        "(version INTEGER NOT NULL, applied_at TEXT NOT NULL)"
+    )
+    row = conn.execute("SELECT MAX(version) AS version FROM bloom_schema_version").fetchone()
+    current = int(row["version"] or 0)
+    for version, name, migrate in _MIGRATIONS:
+        if version <= current:
+            continue
+        logger.info("migrating %s to schema v%d (%s)", path, version, name)
+        migrate(conn, peers)
+        conn.execute(
+            "INSERT INTO bloom_schema_version (version, applied_at) VALUES (?,?)",
+            (version, _now()),
+        )
+        conn.commit()
 
 
 _SCHEMA = """
@@ -303,7 +509,17 @@ def _json_obj(raw: Any) -> dict:
 class Store:
     """Bloom's tables. Synchronous by design; wrap calls in ``asyncio.to_thread``."""
 
-    def __init__(self, path: str = "data/bloom.db") -> None:
+    def __init__(
+        self, path: str = "data/bloom.db", *, peers: dict[str, dict] | None = None
+    ) -> None:
+        """Open (or create) the database and bring its schema up to date.
+
+        ``peers`` is only read by a migration: ``{name: {"url": str, "secret": bytes}}``,
+        the static peer map, needed because a peer that used to be a bare name now
+        has to become a connection carrying its own URL. `get_store` supplies it;
+        a test or a tool constructing a ``Store`` directly can leave it out and get
+        peers stored ``pending``.
+        """
         if path != ":memory:":
             Path(path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         # check_same_thread=False: the connection is reused from asyncio.to_thread
@@ -319,9 +535,9 @@ class Store:
             self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
-            # After the script, not before: a brand-new file has no agent_configs
-            # table to inspect until the schema has been applied to it.
-            _reject_legacy_schema(self._conn, path)
+            # After the script, not before: a migration reads and writes the new
+            # tables, which a brand-new file does not have until this has run.
+            _apply_migrations(self._conn, path, peers or {})
         logger.info("Store ready at %s", path)
 
     # --- agent configs -------------------------------------------------------
@@ -1324,4 +1540,38 @@ def get_store() -> Store:
     """
     from app.config import get_settings
 
-    return Store(get_settings().db_path)
+    settings = get_settings()
+    return Store(settings.db_path, peers=_static_peers(settings))
+
+
+def _static_peers(settings: Settings) -> dict[str, dict]:
+    """``BLOOM_MCP_PEERS`` as the mapping the v1 migration needs, or ``{}``.
+
+    Only a migration reads this, and only once: a peer that was a bare name
+    resolved through the shared registry has to become a connection carrying its
+    own URL and bearer, and this is the only place those two were ever written
+    down together.
+
+    The bearer is encrypted here rather than in `app.db` because storage does not
+    hold the key. Encryption failing is not fatal — a fresh install legitimately
+    has no Fernet key at all — so the peer is carried across without one and
+    `_peer_resolver` reports it unusable, which is a row to fix rather than a boot
+    that fails.
+    """
+    peers: dict[str, dict] = {}
+    secret: bytes | None = None
+    if settings.mcp_peer_token.strip():
+        from app.crypto import encrypt
+
+        try:
+            secret = encrypt(settings.mcp_peer_token.strip(), settings)
+        except Exception:  # noqa: BLE001 — no key configured is a normal state
+            logger.warning(
+                "BLOOM_MCP_PEER_TOKEN cannot be encrypted (no usable BLOOM_FERNET_KEYS); "
+                "migrated peers will need their token pasted in Aperture"
+            )
+    for entry in settings.mcp_peers.split(","):
+        name, _, url = entry.partition("=")
+        if name.strip() and url.strip():
+            peers[name.strip()] = {"url": url.strip(), "secret": secret}
+    return peers

@@ -1,6 +1,6 @@
 [project]
 name = "bloom"
-version = "0.1.0"
+version = "0.2.1"
 description = "Bloom — define reusable agent configurations, and run them on behalf of other agents."
 requires-python = ">=3.11"
 dependencies = [

@@ -411,52 +411,224 @@ def test_kinds_is_not_read_as_a_connection_id(client):
     assert client.get("/admin/connections/kinds", headers=AUTH).status_code == 200
 
 
-# --- the database this version cannot read -------------------------------------
+# --- migrating a database written before connections existed -------------------
+#
+# 0.2.0 refused these files instead of carrying them across, which crash-looped every
+# existing install at boot. What follows is the 0.1.0 schema verbatim, so these
+# assert against the thing that is actually on disk rather than against a summary
+# of it.
+
+_V010_SCHEMA = """
+CREATE TABLE agent_configs (
+    id               TEXT    PRIMARY KEY,
+    slug             TEXT    NOT NULL UNIQUE,
+    name             TEXT    NOT NULL DEFAULT '',
+    system_prompt    TEXT    NOT NULL DEFAULT '',
+    model_tier       TEXT    NOT NULL DEFAULT 'balanced',
+    mcp_servers_json TEXT    NOT NULL DEFAULT '[]',
+    max_steps        INTEGER,
+    max_cost_usd     REAL,
+    created_at       TEXT    NOT NULL,
+    updated_at       TEXT    NOT NULL
+);
+CREATE TABLE oauth_connections (
+    id              TEXT PRIMARY KEY,
+    provider        TEXT NOT NULL,
+    agent_config_id TEXT,
+    access_token    BLOB,
+    refresh_token   BLOB,
+    expires_at      TEXT,
+    scopes_json     TEXT NOT NULL DEFAULT '[]',
+    status          TEXT NOT NULL DEFAULT 'pending',
+    encrypted_at    TEXT,
+    last_used_at    TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+CREATE TABLE agent_config_oauth (
+    agent_config_id     TEXT NOT NULL,
+    oauth_connection_id TEXT NOT NULL,
+    PRIMARY KEY (agent_config_id, oauth_connection_id)
+);
+CREATE TABLE oauth_states (
+    state           TEXT PRIMARY KEY,
+    agent_config_id TEXT NOT NULL,
+    provider        TEXT NOT NULL,
+    code_verifier   TEXT NOT NULL DEFAULT '',
+    redirect_uri    TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL,
+    expires_at      TEXT NOT NULL
+);
+"""
+
+_T = "2026-01-01T00:00:00Z"
 
 
-def test_a_database_from_before_connections_is_refused_at_startup(tmp_path):
-    """`CREATE TABLE IF NOT EXISTS` is a no-op against an old file.
-
-    Without this the mismatch surfaces deep inside a route, as a pydantic error
-    about a column nobody has heard of. Bloom has never been deployed, so the
-    honest handling is to say what happened and where the delete button is.
-    """
+def _v010_database(path, *, peers="[]", owner=None):
+    """A 0.1.0 file holding one agent, one credential and one binding."""
     import sqlite3
 
-    path = str(tmp_path / "old.db")
     conn = sqlite3.connect(path)
-    conn.execute("CREATE TABLE oauth_connections (id TEXT PRIMARY KEY)")
-    conn.commit()
-    conn.close()
-
-    with pytest.raises(db_module.SchemaTooOld) as caught:
-        db_module.Store(path)
-
-    message = str(caught.value)
-    assert "oauth_connections" in message
-    assert path in message
-    assert "-wal" in message
-
-
-def test_a_legacy_column_on_agent_configs_is_caught_too(tmp_path):
-    import sqlite3
-
-    path = str(tmp_path / "old2.db")
-    conn = sqlite3.connect(path)
+    conn.executescript(_V010_SCHEMA)
     conn.execute(
-        "CREATE TABLE agent_configs (id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, "
-        "name TEXT NOT NULL DEFAULT '', system_prompt TEXT NOT NULL DEFAULT '', "
-        "model_tier TEXT NOT NULL DEFAULT 'balanced', mcp_servers_json TEXT NOT NULL DEFAULT '[]', "
-        "max_steps INTEGER, max_cost_usd REAL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        "INSERT INTO agent_configs (id, slug, name, system_prompt, model_tier, "
+        "mcp_servers_json, created_at, updated_at) VALUES ('a1','helper','Helper','be brief',"
+        f"'balanced','{peers}','{_T}','{_T}')"
+    )
+    conn.execute(
+        "INSERT INTO oauth_connections (id, provider, agent_config_id, access_token, "
+        "refresh_token, scopes_json, status, created_at, updated_at) "
+        "VALUES ('c1','spotify',?,?,?,'[\"read\"]','active',?,?)",
+        (owner, b"cipher-access", b"cipher-refresh", _T, _T),
+    )
+    if owner is None:
+        conn.execute(
+            "INSERT INTO agent_config_oauth (agent_config_id, oauth_connection_id) "
+            "VALUES ('a1','c1')"
+        )
+    conn.execute(
+        "INSERT INTO oauth_states (state, agent_config_id, provider, created_at, expires_at) "
+        f"VALUES ('s1','a1','spotify','{_T}','{_T}')"
     )
     conn.commit()
     conn.close()
 
-    with pytest.raises(db_module.SchemaTooOld, match="mcp_servers_json"):
-        db_module.Store(path)
+
+def test_a_010_database_is_migrated_rather_than_refused(tmp_path):
+    """The whole point: an existing install boots, keeping what it had."""
+    path = str(tmp_path / "old.db")
+    _v010_database(path, peers='["amber"]')
+
+    store = db_module.Store(path, peers={"amber": {"url": "https://amber.example", "secret": None}})
+
+    connections = {c["name"]: c for c in store.list_connections()}
+    assert connections["spotify"]["kind"] == "oauth"
+    assert connections["spotify"]["provider"] == "spotify"
+    assert connections["spotify"]["status"] == "active"
+    assert connections["spotify"]["scopes"] == ["read"]
+    assert connections["spotify"]["has_secret"] is True
+    # The id survives, so nothing that already pointed at this credential has to be
+    # rewritten — and re-running the migration re-derives it instead of duplicating.
+    assert connections["spotify"]["id"] == "c1"
+    # The bytes survive too. A migration that silently emptied a token column would
+    # look like a clean upgrade and fail on the next model call.
+    assert store.connection_secrets("c1")["secret"] == b"cipher-access"
+
+    assert connections["amber"]["kind"] == "mcp"
+    assert connections["amber"]["provider"] is None
+    assert connections["amber"]["config"] == {"url": "https://amber.example"}
+    assert connections["amber"]["status"] == "active"
+
+    # Attached, in broker order: credentials before peers, as before the change.
+    assert [c["name"] for c in store.connections_for("a1")] == ["spotify", "amber"]
+    store.close()
+
+
+def test_migration_retires_the_old_shapes(tmp_path):
+    """The legacy tables and column go, or `_config_row` hands pydantic a stranger."""
+    path = str(tmp_path / "old.db")
+    _v010_database(path, peers='["amber"]')
+    store = db_module.Store(path)
+
+    with store._lock:  # noqa: SLF001 — asserting on the schema itself
+        tables = {
+            r["name"]
+            for r in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        columns = {r["name"] for r in store._conn.execute("PRAGMA table_info(agent_configs)")}
+        states = {r["name"] for r in store._conn.execute("PRAGMA table_info(oauth_states)")}
+    assert "oauth_connections" not in tables
+    assert "agent_config_oauth" not in tables
+    assert "mcp_servers_json" not in columns
+    # Rebuilt, not left in its old shape: a flow now belongs to a connection.
+    assert "connection_id" in states and "agent_config_id" not in states
+
+    assert store.get_config("a1")["slug"] == "helper"
+    store.close()
+
+
+def test_the_ownership_column_becomes_an_edge_too(tmp_path):
+    """0.1.0 recorded reach two ways. Reading only one of them would drop credentials."""
+    path = str(tmp_path / "owned.db")
+    _v010_database(path, owner="a1")  # no row in agent_config_oauth at all
+
+    store = db_module.Store(path)
+    assert [c["id"] for c in store.connections_for("a1")] == ["c1"]
+    store.close()
+
+
+def test_a_peer_with_no_configured_url_survives_as_pending(tmp_path):
+    """Dropping it would erase the only record that the agent was wired to it."""
+    path = str(tmp_path / "nourl.db")
+    _v010_database(path, peers='["ghost"]')
+
+    store = db_module.Store(path, peers={})  # nothing in BLOOM_MCP_PEERS
+    ghost = next(c for c in store.list_connections() if c["name"] == "ghost")
+    assert ghost["status"] == "pending"
+    assert ghost["config"] == {"url": ""}
+    assert [c["name"] for c in store.connections_for("a1")] == ["spotify", "ghost"]
+    store.close()
+
+
+def test_migrating_is_idempotent(tmp_path):
+    """Re-opening the file must not duplicate a thing — including after a crash."""
+    path = str(tmp_path / "twice.db")
+    _v010_database(path, peers='["amber"]')
+
+    first = db_module.Store(path, peers={"amber": {"url": "https://amber.example"}})
+    before = [(c["id"], c["name"]) for c in first.list_connections()]
+    first.close()
+
+    second = db_module.Store(path, peers={"amber": {"url": "https://amber.example"}})
+    assert [(c["id"], c["name"]) for c in second.list_connections()] == before
+    assert len(second.connections_for("a1")) == 2
+    second.close()
+
+
+def test_two_credentials_for_one_provider_get_distinct_names(tmp_path):
+    """`name` is UNIQUE and, for peers, a tool namespace. A collision must not insert."""
+    import sqlite3
+
+    path = str(tmp_path / "dupe.db")
+    _v010_database(path)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO oauth_connections (id, provider, access_token, scopes_json, status, "
+        f"created_at, updated_at) VALUES ('c2','spotify',NULL,'[]','active','{_T}','{_T}')"
+    )
+    conn.commit()
+    conn.close()
+
+    store = db_module.Store(path)
+    assert sorted(c["name"] for c in store.list_connections()) == ["spotify", "spotify-2"]
+    store.close()
+
+
+def test_a_peer_name_the_namespace_rule_rejects_is_repaired_not_dropped(tmp_path):
+    """0.1.0 never validated these names; `<name>__<tool>` now depends on them."""
+    path = str(tmp_path / "odd.db")
+    _v010_database(path, peers='["9 Live!"]')
+
+    store = db_module.Store(path)
+    names = {c["name"] for c in store.list_connections()}
+    assert names == {"spotify", "c-9-live"}
+    # The original is kept as the label, so the row still says where it came from.
+    peer = next(c for c in store.list_connections() if c["kind"] == "mcp")
+    assert peer["label"] == "9 Live!"
+    store.close()
 
 
 def test_a_fresh_database_is_fine(tmp_path):
     store = db_module.Store(str(tmp_path / "new.db"))
     assert store.list_connections() == []
+    store.close()
+
+
+def test_a_fresh_database_is_stamped_so_migrations_do_not_re_run(tmp_path):
+    """A file with no version row reads as 0, exactly like a 0.1.0 one."""
+    path = str(tmp_path / "stamp.db")
+    store = db_module.Store(path)
+    with store._lock:  # noqa: SLF001
+        row = store._conn.execute("SELECT MAX(version) AS v FROM bloom_schema_version").fetchone()
+    assert row["v"] == len(db_module._MIGRATIONS)
     store.close()

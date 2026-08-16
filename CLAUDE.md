@@ -171,9 +171,21 @@ not writer/writer) and why the trace writer must stay off the model loop's threa
 Raw `sqlite3`, house pattern (`agent-mcp-py/CLAUDE.md:88`): module-level `_SCHEMA`
 of `CREATE TABLE IF NOT EXISTS`, one connection under a `threading.Lock`, rows out
 as dicts, ISO-8601 UTC-seconds TEXT, sync methods wrapped in `asyncio.to_thread` at
-the call site. No ORM, no migrations, no Postgres — the build spec said Postgres and
-SQLAlchemy; every other service in the ecosystem does this, and `backup-sqlite.sh`
-already exists.
+the call site. No ORM, no Postgres — the build spec said Postgres and SQLAlchemy;
+every other service in the ecosystem does this, and `backup-sqlite.sh` already
+exists.
+
+**There is a migration runner** (`bloom_schema_version` + an ordered `_MIGRATIONS`
+tuple, applied in `Store.__init__`), and the reason is worth keeping. 0.2.0 renamed
+`oauth_connections` → `connections` and dropped `mcp_servers_json`, and shipped a
+guard that *refused* any older file on the reasoning that "Bloom has never been
+deployed". It had been — 0.1.0 was live on the box — and since `CREATE TABLE IF NOT
+EXISTS` leaves an old file untouched, every existing install crash-looped at boot
+with `unhealthy` as the only symptom. The version lives in a table rather than
+`PRAGMA user_version` because that pragma is one file-wide slot and this file has
+three tenants. Add migrations by appending; never renumber, and every one must be a
+no-op against a fresh database, because a fresh file and a pre-versioning file both
+report 0.
 
 ### Execution — `app/runtime_service.py`
 

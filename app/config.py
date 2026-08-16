@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     # Doubles as the MCP namespace and the resource URI scheme, so it must be
     # snake_case and <= 22 chars; agent-mcp-py validates it at construction.
     app_name: str = "bloom"
-    version: str = "0.1.0"
+    version: str = "0.2.1"
     port: int = 8010
     log_level: str = "info"
 
