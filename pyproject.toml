@@ -25,7 +25,7 @@ dependencies = [
     # most apps publish tools and let someone else do the thinking; Bloom *is*
     # that someone else, so it is the one app that must embed the runtime. The
     # [mcp] extra lets a configured agent call peer servers as a client.
-    "agent-runtime[mcp] @ git+https://github.com/Johonnyy/agent-runtime@9621f42",
+    "agent-runtime[mcp] @ git+https://github.com/Johonnyy/agent-runtime@6f648fd",
     # Token encryption at rest (Fernet / MultiFernet). See app/crypto.py.
     "cryptography>=43.0",
     # NOT httpx. mcp v2 ships httpx2 as a separate distribution with a separate
