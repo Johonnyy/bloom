@@ -7,9 +7,30 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from app.config import Settings
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(autouse=True)
+def no_ambient_config(monkeypatch):
+    """Hide every ``BLOOM_*`` variable already in the environment.
+
+    ``_env_file=None`` stops pydantic reading the *file*, which is what these tests
+    used to rely on — but `app.config` calls ``load_dotenv`` at import, deliberately,
+    so that a provider manifest can name its own credential variables. That exports
+    `.env` into ``os.environ``, where `Settings` still reads it.
+
+    So the moment a developer actually fills in a `.env` — which is the moment they
+    start using the thing — every assertion about a *default* below starts failing
+    against their real configuration. Clearing the prefix is what makes "without
+    touching disk" true rather than merely intended.
+    """
+    for key in list(os.environ):
+        if key.startswith("BLOOM_"):
+            monkeypatch.delenv(key, raising=False)
 
 
 def _settings(**over) -> Settings:
