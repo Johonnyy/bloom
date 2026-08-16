@@ -20,12 +20,12 @@ dependencies = [
     # per-call usage logging and sync-store registration all arrive with the
     # decorators. Pinned by commit SHA rather than tag because the repo is not
     # tagged yet — switch to @v0.1.0 when it is.
-    "agent-mcp-py @ git+https://github.com/Johonnyy/agent-mcp-py@793a449",
+    "agent-mcp-py @ git+https://github.com/Johonnyy/agent-mcp-py@01b7493",
     # The agentic loop itself. The template leaves this commented out because
     # most apps publish tools and let someone else do the thinking; Bloom *is*
     # that someone else, so it is the one app that must embed the runtime. The
     # [mcp] extra lets a configured agent call peer servers as a client.
-    "agent-runtime[mcp] @ git+https://github.com/Johonnyy/agent-runtime@8bd6ae6",
+    "agent-runtime[mcp] @ git+https://github.com/Johonnyy/agent-runtime@9621f42",
     # Token encryption at rest (Fernet / MultiFernet). See app/crypto.py.
     "cryptography>=43.0",
     # NOT httpx. mcp v2 ships httpx2 as a separate distribution with a separate
