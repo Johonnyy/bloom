@@ -50,6 +50,8 @@ from agent_runtime import (
 )
 from agent_runtime import Settings as RuntimeSettings
 
+from app import models
+from app.builder import is_builder
 from app.config import Settings, get_settings
 from app.credentials import CredentialResolver
 from app.crypto import UndecryptableToken, decrypt
@@ -175,11 +177,21 @@ def _peer_resolver(
     for connection in connections:
         if connection["kind"] != "mcp" or connection["status"] != "active":
             continue
-        url = str((connection["config"] or {}).get("url") or "").strip()
+        config = connection["config"] or {}
+        url = str(config.get("url") or "").strip()
         if not url:
             logger.warning("MCP connection %s has no url; skipping", connection["name"])
             continue
-        record: dict[str, Any] = {"base_url": url}
+        # `url` vs `base_url` decides whether `MCPClient` uses the string verbatim.
+        # Its `_endpoint` appends `/mcp` and a trailing slash to a `base_url`, which
+        # is right for an ecosystem peer entered as a bare host and wrong for a
+        # server discovered from the MCP registry, whose remotes are already complete
+        # endpoints (`https://server.smithery.ai/@owner/thing/mcp`). Appending there
+        # yields `/mcp/mcp/` and a 404 that reads like the server being down.
+        #
+        # So the distinction is stored rather than guessed: whoever created the
+        # connection knew which kind of URL it was, and said so.
+        record: dict[str, Any] = {"url": url} if config.get("endpoint") else {"base_url": url}
         row = store.connection_secrets(connection["id"])
         if row is not None and row["secret"]:
             try:
@@ -239,7 +251,18 @@ def build_runner(
     connections = store.connections_for(config["id"])
 
     brokers: list[Any] = []
-    # Credential tools first: a peer server must never be able to shadow a tool
+    # First, and only for the builder. These are the tools that write configurations
+    # and connections, and nothing an operator can attach produces them: they are not
+    # derived from `connections` at all, so the only way to reach them is to *be* the
+    # row whose slug is BUILDER_SLUG — which the admin validators reserve and the
+    # UNIQUE index makes unforgeable. First in the list for the same reason
+    # credentials precede peers below: nothing attached should be able to shadow them.
+    if is_builder(config) and settings.feature_builder:
+        from app.builder.tools import builder_broker
+
+        brokers.append(builder_broker(store, settings, run_id=recorder.run_id))
+
+    # Credential tools next: a peer server must never be able to shadow a tool
     # that carries the user's own account access.
     credentials = _connection_broker(connections, config, store, settings)
     if credentials is not None:
@@ -262,13 +285,27 @@ def build_runner(
     # able to see rather than infer from silence.
     broker = TracingBroker(inner, recorder) if inner is not None else None
 
-    max_steps = min(config.get("max_steps") or settings.max_steps, settings.max_steps)
-    max_cost = min(config.get("max_cost_usd") or settings.max_cost_usd, settings.max_cost_usd)
+    # Two ceilings, and which one applies is a property of the agent rather than of
+    # the request. A delegated task is a handful of steps; a build is inspect, search
+    # the registry, read a page or two, create, verify, write the checklist — 12 to 25
+    # — and clamping that to the service default of 8 would truncate every build.
+    # Raising the *service* ceiling instead would raise it for every unattended task,
+    # which is precisely what that ceiling exists to prevent.
+    #
+    # The invariant is unchanged: a config may lower its ceiling but never raise it.
+    # There are simply two of them.
+    ceiling_steps = settings.builder_max_steps if is_builder(config) else settings.max_steps
+    ceiling_cost = settings.builder_max_cost_usd if is_builder(config) else settings.max_cost_usd
+    max_steps = min(config.get("max_steps") or ceiling_steps, ceiling_steps)
+    max_cost = min(config.get("max_cost_usd") or ceiling_cost, ceiling_cost)
 
     system_prompt = (config.get("system_prompt") or "") + _connection_notes(connections, settings)
 
     runner = AgentRunner(
-        model=config.get("model_tier") or settings.default_tier,
+        # Resolved here rather than handed over as a keyword: the vocabulary is the
+        # ecosystem's model keywords, and `agent_runtime.model_router` knows only
+        # three of them — it would raise `UnknownTier` on `coding`.
+        model=models.resolve(config.get("model_tier"), settings),
         broker=broker,
         system_prompt=system_prompt,
         stop_conditions=[StopOnSteps(max_steps), StopOnCost(max_cost)],
@@ -327,6 +364,7 @@ async def execute_run(
     caller: str = "",
     settings: Settings | None = None,
     store: Store | None = None,
+    timeout_s: float | None = None,
 ) -> dict:
     """Run a task end to end and record it. The single execution path.
 
@@ -338,6 +376,11 @@ async def execute_run(
     attach to the trace while the run is still in flight, and the terminal event is
     emitted on every path out, including cancellation, because that event is the
     only thing that ends a stream.
+
+    ``timeout_s`` overrides the service-wide wall clock for this one invocation. A
+    parameter rather than a config lookup because it is a property of *what is being
+    run*, not of the deployment: a build makes six network round trips and needs
+    minutes, while a delegated task that has not answered in five is stuck.
     """
     settings = settings or get_settings()
     store = store or get_store()
@@ -380,7 +423,7 @@ async def execute_run(
     cancelled = False
 
     try:
-        async with asyncio.timeout(settings.run_timeout_s):
+        async with asyncio.timeout(timeout_s or settings.run_timeout_s):
             result = await runner.run(
                 prompt,
                 conversation_id=conversation_id or run_id,
@@ -397,7 +440,7 @@ async def execute_run(
         status, error, cancelled = "cancelled", "cancelled", True
     except TimeoutError:
         status = "failed"
-        error = f"timed out after {settings.run_timeout_s:.0f}s"
+        error = f"timed out after {timeout_s or settings.run_timeout_s:.0f}s"
         logger.warning("Run %s %s", run_id, error)
     except Exception as exc:  # noqa: BLE001 — one bad run must not take down the service
         status = "failed"

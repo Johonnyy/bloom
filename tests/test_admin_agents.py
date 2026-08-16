@@ -24,6 +24,17 @@ ADMIN_TOKEN = "admin-secret"  # noqa: S105 — a fixture value, not a credential
 AUTH = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 
+def authored(client) -> list[dict]:
+    """The agents a *caller* created.
+
+    Every Bloom seeds its own builder at startup, so the raw list is never empty and
+    a test asserting on absolute counts would be counting a built-in. Filtering on
+    ``builtin`` states the invariant these tests actually care about, and keeps
+    working if another built-in is ever added.
+    """
+    return [a for a in client.get("/admin/agents", headers=AUTH).json() if not a["builtin"]]
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     """A TestClient over a fresh database, configured the way a deploy would be."""
@@ -74,8 +85,7 @@ def test_a_config_survives_a_full_create_read_update_delete_round_trip(client):
     assert fetched.status_code == 200
     assert fetched.json() == body
 
-    listed = client.get("/admin/agents", headers=AUTH)
-    assert [c["id"] for c in listed.json()] == [config_id]
+    assert [c["id"] for c in authored(client)] == [config_id]
 
     patched = client.patch(
         f"/admin/agents/{config_id}", headers=AUTH, json={"system_prompt": "You pick GOOD music."}
@@ -120,7 +130,7 @@ def test_a_duplicate_slug_is_a_conflict_not_a_second_row(client):
     assert clash.json()["error"] == "conflict"
     assert "finance-ops" in clash.json()["message"]
 
-    assert len(client.get("/admin/agents", headers=AUTH).json()) == 1
+    assert len(authored(client)) == 1
 
 
 def test_an_unknown_model_tier_is_rejected_at_edit_time(client):
@@ -171,4 +181,7 @@ def test_health_is_shallow_by_default_and_reads_a_row_when_deep(client):
     deep = client.get("/health?deep=true").json()
     assert deep["status"] == "ok"
     assert deep["database"] == "ok"
-    assert deep["agents"] == 0
+    # One, not zero: a fresh Bloom seeds its own builder at startup. The count is a
+    # diagnostic — "a read worked and returned something" — so it reports what is
+    # really in the table rather than hiding a row to look tidy.
+    assert deep["agents"] == 1

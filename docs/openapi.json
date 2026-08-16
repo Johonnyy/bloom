@@ -60,6 +60,11 @@
       },
       "AgentConfigOut": {
         "properties": {
+          "builtin": {
+            "default": false,
+            "title": "Builtin",
+            "type": "boolean"
+          },
           "connections": {
             "items": {
               "type": "string"
@@ -235,6 +240,144 @@
           "connection_id"
         ],
         "title": "AttachIn",
+        "type": "object"
+      },
+      "BuildIn": {
+        "additionalProperties": false,
+        "properties": {
+          "brief": {
+            "description": "Plain language: 'a Spotify agent that can play and search music'.",
+            "maxLength": 4000,
+            "minLength": 3,
+            "title": "Brief",
+            "type": "string"
+          }
+        },
+        "required": [
+          "brief"
+        ],
+        "title": "BuildIn",
+        "type": "object"
+      },
+      "BuildOut": {
+        "properties": {
+          "agent_config_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Config Id"
+          },
+          "agent_slug": {
+            "title": "Agent Slug",
+            "type": "string"
+          },
+          "brief": {
+            "title": "Brief",
+            "type": "string"
+          },
+          "checklist": {
+            "items": {
+              "$ref": "#/components/schemas/SetupStep"
+            },
+            "title": "Checklist",
+            "type": "array"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "done": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Done",
+            "type": "array"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "run_id",
+          "brief",
+          "agent_config_id",
+          "agent_slug",
+          "status",
+          "summary",
+          "checklist",
+          "done",
+          "error",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "BuildOut",
+        "type": "object"
+      },
+      "BuildStarted": {
+        "properties": {
+          "build_id": {
+            "title": "Build Id",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "stream_url": {
+            "title": "Stream Url",
+            "type": "string"
+          },
+          "trace_url": {
+            "title": "Trace Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "build_id",
+          "run_id",
+          "status",
+          "stream_url",
+          "trace_url"
+        ],
+        "title": "BuildStarted",
         "type": "object"
       },
       "ConnectionIn": {
@@ -525,6 +668,65 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "KeywordOut": {
+        "properties": {
+          "builtin": {
+            "title": "Builtin",
+            "type": "boolean"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "overridden": {
+            "title": "Overridden",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "model",
+          "description",
+          "builtin",
+          "overridden"
+        ],
+        "title": "KeywordOut",
+        "type": "object"
+      },
+      "KeywordsOut": {
+        "properties": {
+          "default": {
+            "title": "Default",
+            "type": "string"
+          },
+          "keywords": {
+            "items": {
+              "$ref": "#/components/schemas/KeywordOut"
+            },
+            "title": "Keywords",
+            "type": "array"
+          },
+          "shared": {
+            "title": "Shared",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "keywords",
+          "shared",
+          "default"
+        ],
+        "title": "KeywordsOut",
+        "type": "object"
+      },
       "ProbeOut": {
         "description": "What a test told us, and which test it was.\n\n``checked`` matters: \"the credential decrypts\" and \"the provider accepted it\"\nare very different claims, and reporting the weaker one as the stronger is how\na green tick comes to mean nothing.",
         "properties": {
@@ -595,6 +797,49 @@
           }
         },
         "title": "SecretIn",
+        "type": "object"
+      },
+      "SetupStep": {
+        "properties": {
+          "connection_name": {
+            "default": "",
+            "title": "Connection Name",
+            "type": "string"
+          },
+          "detail": {
+            "default": "",
+            "title": "Detail",
+            "type": "string"
+          },
+          "done_when": {
+            "default": "",
+            "title": "Done When",
+            "type": "string"
+          },
+          "env_name": {
+            "default": "",
+            "title": "Env Name",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "url": {
+            "default": "",
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "title"
+        ],
+        "title": "SetupStep",
         "type": "object"
       },
       "StartIn": {
@@ -1477,6 +1722,337 @@
         ]
       }
     },
+    "/admin/builder/build": {
+      "post": {
+        "description": "Start a build and return where to watch it.\n\n202 rather than 200: a build takes minutes, and the id is what a live panel\nattaches to. There is no race \u2014 the trace stream replays from the beginning of\nthe log before tailing, so connecting late loses nothing.",
+        "operationId": "build_admin_builder_build_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildStarted"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Build",
+        "tags": [
+          "builder"
+        ]
+      }
+    },
+    "/admin/builds": {
+      "get": {
+        "description": "Builds, newest first. Filter by status to find what still needs a credential.",
+        "operationId": "list_builds_admin_builds_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "running | needs_setup | ready | failed",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "running | needs_setup | ready | failed",
+              "title": "Status"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/BuildOut"
+                  },
+                  "title": "Response List Builds Admin Builds Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Builds",
+        "tags": [
+          "builder"
+        ]
+      }
+    },
+    "/admin/builds/{build_id}": {
+      "delete": {
+        "description": "Forget a build. **The agent it created, and its run history, survive.**\n\nDeleting the record of how something was made is not deleting the thing \u2014 the\nsame posture as deleting an agent leaving its connections alone.",
+        "operationId": "delete_build_admin_builds__build_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "build_id",
+            "required": true,
+            "schema": {
+              "title": "Build Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Build",
+        "tags": [
+          "builder"
+        ]
+      },
+      "get": {
+        "operationId": "get_build_admin_builds__build_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "build_id",
+            "required": true,
+            "schema": {
+              "title": "Build Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Build",
+        "tags": [
+          "builder"
+        ]
+      }
+    },
+    "/admin/builds/{build_id}/steps/{index}/done": {
+      "post": {
+        "description": "Tick one step off. Idempotent \u2014 ticking twice is not an error.",
+        "operationId": "mark_step_done_admin_builds__build_id__steps__index__done_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "build_id",
+            "required": true,
+            "schema": {
+              "title": "Build Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "index",
+            "required": true,
+            "schema": {
+              "title": "Index",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mark Step Done",
+        "tags": [
+          "builder"
+        ]
+      }
+    },
     "/admin/connections": {
       "get": {
         "description": "The whole library, newest first.",
@@ -2199,6 +2775,56 @@
         "summary": "Test Connection",
         "tags": [
           "connections"
+        ]
+      }
+    },
+    "/admin/models/keywords": {
+      "get": {
+        "description": "The vocabulary an agent's ``model_tier`` may name, and where each points.",
+        "operationId": "list_keywords_admin_models_keywords_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeywordsOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Keywords",
+        "tags": [
+          "models"
         ]
       }
     },

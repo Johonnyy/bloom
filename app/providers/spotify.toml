@@ -26,12 +26,6 @@ auth = "oauth"
 pkce = true
 refresh_rotates = true
 
-# What "Test connection" calls: cheap, read-only, and needs no arguments. Its 200
-# proves the stored credential is live in a way that decrypting it cannot.
-[probe]
-method = "GET"
-path = "/me"
-
 # How the client credentials are presented at the token endpoint. Spotify accepts
 # HTTP Basic; some providers only accept them in the form body.
 auth_style = "basic"
@@ -44,6 +38,19 @@ scopes_default = [
 ]
 
 docs_url = "https://developer.spotify.com/documentation/web-api"
+
+# What "Test connection" calls: cheap, read-only, and needs no arguments. Its 200
+# proves the stored credential is live in a way that decrypting it cannot.
+#
+# NOTE FOR ANYONE ADDING A PROVIDER: every bare key must appear ABOVE the first
+# `[table]` header. TOML assigns a key to the most recently opened table, so a
+# `scopes_default` written after `[probe]` silently becomes `probe.scopes_default`
+# — the manifest still loads, and the provider quietly gets no scopes. That is
+# exactly what happened here: `operations_for` then hid play, pause and
+# now_playing, leaving Spotify with only `search`. Keep tables last.
+[probe]
+method = "GET"
+path = "/me"
 
 [[operations]]
 name = "search"

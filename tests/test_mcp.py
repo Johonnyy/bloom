@@ -50,16 +50,21 @@ def test_the_expected_tools_and_resources_are_registered():
 
     A server that grows tools is a server whose callers must re-read its
     description; Bloom's answer to "can you do X" is a config, not a new tool.
+
+    ``build_agent`` is the one addition that earns its place, because it is the
+    exception to that rule: "make me a config" cannot itself be a config.
     """
     mcp = mcp_module.build_server(_settings())
-    assert {t.name for t in mcp.tool_policies()} == {"run_task", "list_agents"}
-    assert len(mcp.resource_policies()) == 1
+    assert {t.name for t in mcp.tool_policies()} == {"run_task", "list_agents", "build_agent"}
+    assert {str(r.uri) for r in mcp.resource_policies()} == {"bloom://agents", "bloom://builds"}
 
 
 def test_query_tools_are_marked_read_only():
     """A caller decides whether it may retry or cache from this flag alone."""
     policies = {t.name: t for t in mcp_module.build_server(_settings()).tool_policies()}
     assert policies["list_agents"].read_only is True
+    # Not read-only: it writes configuration and spends money.
+    assert policies["build_agent"].read_only is False
 
 
 # --- what a delegating agent is told about capability ---

@@ -12,14 +12,21 @@ A connection is an OAuth account, an API key, or an MCP server, and it lives in 
 global library: approve Spotify once and any agent can attach it. Creating an agent
 asks for a slug and nothing else.
 
+**Or you can just describe one.** Tell Bloom "create a Spotify agent that can play
+and search music" — from Aperture, or from Amber over MCP — and its own builder
+researches the service, prefers an existing MCP server over anything it would have to
+carry itself, picks a model keyword from the work, writes the agent and its
+connections, and hands back the setup steps you still have to do. It never holds a
+credential, so everything it makes is inert until you attach one.
+
 It is the service the ecosystem docs have been calling `agent-spawner`.
 
 ## Two surfaces, two audiences
 
 | | | |
 |---|---|---|
-| `/mcp` | **Execution.** One tool, `run_task`. | How *other agents* delegate. MCP, because a model has to discover and choose it. |
-| `/admin/*` | **Management.** CRUD over configs, test runs, run history, OAuth. | How *Aperture* edits them. Plain REST, because a GUI wants an OpenAPI schema and a generated client, not tool selection. |
+| `/mcp` | **Execution.** `run_task` to delegate, `build_agent` to create. | How *other agents* reach it. MCP, because a model has to discover and choose. |
+| `/admin/*` | **Management.** CRUD over configs, connections, test runs, run history, builds. | How *Aperture* edits them. Plain REST, because a GUI wants an OpenAPI schema and a generated client, not tool selection. |
 
 Both are bearer-authenticated, with **deliberately separate key sets**
 (`BLOOM_MCP_KEYS` and `BLOOM_ADMIN_KEYS`): a desktop GUI that can edit
@@ -69,16 +76,22 @@ curl -H "Authorization: Bearer $KEY" localhost:8010/admin/agents
 
 ## What is built
 
-All of it, with 75 tests and no network needed to run them.
+All of it, with 259 tests and no network needed to run them.
 
 - [x] Agent config CRUD (`/admin/agents`), the store, the error envelope, auth
-- [x] `/mcp` — `run_task`, `list_agents`, the `bloom://agents` resource
+- [x] `/mcp` — `run_task`, `build_agent`, `list_agents`, `bloom://agents`,
+      `bloom://builds`
 - [x] Execution: `runtime_service.build_runner`, ceilings, broker teardown
 - [x] Run trace: `run_events`, live SSE with `Last-Event-ID` resumption, test-run
 - [x] Connections: one library, three kinds (`oauth` / `api_key` / `mcp`), shared
       across agents, with a `/test` probe that actually contacts the far end
 - [x] OAuth: provider manifests, Fernet-at-rest, PKCE, the `aperture://` handoff
 - [x] Proactive token refresh, plus a call-time check the sweep cannot replace
+- [x] The builder (`app/builder/`) — MCP-registry-first research, Tavily search and
+      a URL reader, agent and connection authoring, and a typed setup checklist.
+      Privileged tools reach exactly one reserved slug and nothing else
+- [x] Model keywords (`app/models.py`) — the ecosystem's ten, pulled from the shared
+      sync store, so `coding` means the same thing here as it does to Amber
 - [x] [docs/aperture-integration.md](docs/aperture-integration.md) + `docs/openapi.json`
 
 Not done, and deliberately: **deploying it.** That is a change to `amber-infra` —
@@ -104,6 +117,14 @@ log, and in Bloom's own trace, so a credential must never be settable as one.
 Tokens are never held by the tools either. Each closes over a *connection id* and
 asks for a live token when it fires, which is what lets a token expire mid-run and
 be refreshed without the task failing.
+
+**One TOML trap worth naming, because it bit this repo.** Every bare key must appear
+*above* the first `[table]` header. TOML assigns a key to the most recently opened
+table, so a `scopes_default` written below `[probe]` silently becomes
+`probe.scopes_default` — the manifest still loads, and the provider quietly gets no
+scopes. `spotify.toml` shipped that way, and `operations_for` was hiding `play`,
+`pause` and `now_playing` as unauthorised, leaving Spotify with only `search`. Keep
+`[probe]` and `[[operations]]` last.
 
 ## One promise this repo does *not* make
 

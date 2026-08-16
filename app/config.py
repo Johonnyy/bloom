@@ -134,6 +134,45 @@ class Settings(BaseSettings):
     # buys both. Same format as mcp_keys.
     admin_keys: str = Field(default="", description="Bearer keys for /admin.")
 
+    # --- Model keywords ---
+    # Amber's vocabulary, not agent_runtime's three-rung ladder. A ladder can only
+    # say "better"; it cannot say "for code" or "for a long document", which is how
+    # a model is actually chosen. `app/models.py` ships the same ten keywords Amber
+    # does and overlays whatever the sync store says they currently point at, so
+    # re-pointing `coding` once moves the whole fleet instead of needing a release
+    # per app. With no sync store configured Bloom simply uses its built-ins.
+    model_sync_interval_s: float = 300.0
+
+    # --- The builder: the agent that writes other agents ---
+    feature_builder: bool = True
+    # The builder reasons about an unfamiliar API from search results and has to
+    # write another agent's instructions, which is the kind of open-ended work the
+    # cheap rungs are bad at. This is the one place paying for a strong model is
+    # obviously worth it: you pay once to author something you then run cheaply.
+    builder_keyword: str = "strong"
+    # The builder's own ceilings, deliberately separate from the service-wide ones.
+    # A real build is 12-25 steps (inspect, search the registry, read a page or two,
+    # create, verify, write the checklist) against a service default of 8. Raising
+    # the global ceiling instead would raise it for every unattended delegated task,
+    # which is precisely what that ceiling exists to prevent.
+    builder_max_steps: int = 30
+    builder_max_cost_usd: float = 2.00
+    builder_run_timeout_s: float = 900.0
+
+    # --- Research (the builder's eyes) ---
+    # Tavily. Without a key the builder is reported unavailable rather than quietly
+    # downgraded: it cannot do its job blind, and a build that guesses an API from
+    # memory is worse than one that refuses.
+    search_api_key: str = ""
+    search_max_results: int = 5
+    search_timeout_s: float = 15.0
+    # `read_url` fetches pages nobody vetted, so both limits bound a hostile answer:
+    # bytes off the wire, and characters handed to the model.
+    read_url_max_bytes: int = 400_000
+    read_url_max_chars: int = 20_000
+    read_url_timeout_s: float = 20.0
+    mcp_registry_url: str = "https://registry.modelcontextprotocol.io"
+
     # --- OAuth (Phase 4) ---
     feature_oauth: bool = False
     # Fernet keys, comma-separated, newest first: the head encrypts, all decrypt.
@@ -169,6 +208,35 @@ class Settings(BaseSettings):
         problem — that one raises at startup, in `app.crypto`.
         """
         return self.feature_oauth and bool(self.fernet_keys.strip())
+
+    @property
+    def builder_enabled(self) -> bool:
+        """True only when the builder can actually do its job.
+
+        Three things, not one. The flag is intent; the OpenRouter key is what runs
+        any agent at all; the search key is what makes *this* agent different from
+        a model guessing an API from memory. Missing any of them is reported as a
+        503 naming which, rather than a build that starts, spends money and ends
+        with a confidently wrong manifest.
+        """
+        return (
+            self.feature_builder
+            and bool(self.openrouter_api_key.strip())
+            and bool(self.search_api_key.strip())
+        )
+
+    def builder_unavailable_reason(self) -> str:
+        """Why the builder cannot run, as a sentence for a 503. Empty when it can."""
+        if not self.feature_builder:
+            return "The builder is switched off (BLOOM_FEATURE_BUILDER=false)."
+        if not self.openrouter_api_key.strip():
+            return "No BLOOM_OPENROUTER_API_KEY is configured, so no agent can run."
+        if not self.search_api_key.strip():
+            return (
+                "No BLOOM_SEARCH_API_KEY is configured. The builder researches a "
+                "service before wiring it, and refuses to work from memory."
+            )
+        return ""
 
 
 @lru_cache

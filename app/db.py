@@ -201,7 +201,7 @@ CREATE TABLE IF NOT EXISTS runs (
     agent_config_id TEXT    NOT NULL,
     conversation_id TEXT    NOT NULL DEFAULT '',
     depth           INTEGER NOT NULL DEFAULT 0,
-    origin          TEXT    NOT NULL,              -- mcp | test_run
+    origin          TEXT    NOT NULL,              -- mcp | test_run | build
     caller          TEXT    NOT NULL DEFAULT '',
     status          TEXT    NOT NULL,
         -- running | succeeded | failed | cancelled | abandoned
@@ -216,6 +216,32 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_agent ON runs (agent_config_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs (status, heartbeat_at);
+
+-- One invocation of the builder: the brief that went in, the agent that came out,
+-- and the steps a human still has to take.
+--
+-- Not folded into `runs`. A run's `result_text` is prose, and what the builder
+-- produces has to be addressable by agent, re-renderable weeks later, and tickable
+-- one item at a time. `status` also carries a distinction no run status can:
+-- `needs_setup` versus `ready` is the difference between "you have work to do" and
+-- "it works now", which is the only question anyone asks of a finished build.
+CREATE TABLE IF NOT EXISTS builds (
+    id              TEXT    PRIMARY KEY,
+    run_id          TEXT    NOT NULL,        -- the join to the trace; minted together
+    brief           TEXT    NOT NULL,
+    agent_config_id TEXT,                    -- NULL until the builder creates one
+    agent_slug      TEXT    NOT NULL DEFAULT '',
+    status          TEXT    NOT NULL,
+        -- running | needs_setup | ready | failed
+    summary         TEXT    NOT NULL DEFAULT '',
+    checklist_json  TEXT    NOT NULL DEFAULT '[]',
+    done_json       TEXT    NOT NULL DEFAULT '[]',   -- indexes ticked off
+    error           TEXT,
+    created_at      TEXT    NOT NULL,
+    updated_at      TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_builds_run ON builds (run_id);
+CREATE INDEX IF NOT EXISTS idx_builds_status ON builds (status, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS run_events (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,  -- the SSE cursor / Last-Event-ID
@@ -1116,6 +1142,113 @@ class Store:
             ).fetchone()
         return int(row["s"])
 
+    # --- builds ----------------------------------------------------------------
+
+    def create_build(self, *, build_id: str, run_id: str, brief: str) -> dict:
+        """Open a build in ``running`` state.
+
+        Committed *before* the run starts, the same ordering and for the same reason
+        as :meth:`create_run`: a client that posted a brief needs something to attach
+        to while the work is still in flight.
+        """
+        now = _now()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO builds (id, run_id, brief, status, created_at, updated_at) "
+                "VALUES (?,?,?, 'running', ?,?)",
+                (build_id, run_id, brief, now, now),
+            )
+            self._conn.commit()
+        return self.get_build(build_id)  # type: ignore[return-value]
+
+    def get_build(self, build_id: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM builds WHERE id = ?", (build_id,)).fetchone()
+        return _build_row(row) if row else None
+
+    def get_build_by_run(self, run_id: str) -> dict | None:
+        """The build a run belongs to. How a tool holding only a run id finds its row."""
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM builds WHERE run_id = ?", (run_id,)).fetchone()
+        return _build_row(row) if row else None
+
+    def list_builds(
+        self, *, limit: int = 50, offset: int = 0, status: str | None = None
+    ) -> list[dict]:
+        """Builds, newest first. ``status`` narrows to e.g. everything still unfinished."""
+        clause = "WHERE status = ?" if status else ""
+        params: list[Any] = [status] if status else []
+        params.extend([max(1, min(limit, 200)), max(0, offset)])
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM builds {clause} ORDER BY created_at DESC, id LIMIT ? OFFSET ?",  # noqa: S608
+                params,
+            ).fetchall()
+        return [_build_row(r) for r in rows]
+
+    def update_build(self, build_id: str, **fields: Any) -> dict | None:
+        """Patch a build. ``None`` means leave alone, never clear.
+
+        ``checklist`` and ``done`` are taken as Python lists and stored as JSON; the
+        rest are plain columns.
+        """
+        editable = {"agent_config_id", "agent_slug", "status", "summary", "error"}
+        sets: list[str] = []
+        values: list[Any] = []
+        for key, value in fields.items():
+            if value is None:
+                continue
+            if key == "checklist":
+                sets.append("checklist_json = ?")
+                values.append(json.dumps(list(value)))
+            elif key == "done":
+                sets.append("done_json = ?")
+                values.append(json.dumps(sorted({int(i) for i in value})))
+            elif key in editable:
+                sets.append(f"{key} = ?")
+                values.append(value)
+        if not sets:
+            return self.get_build(build_id)
+
+        sets.append("updated_at = ?")
+        values.extend([_now(), build_id])
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE builds SET {', '.join(sets)} WHERE id = ?",  # noqa: S608
+                values,
+            )
+            self._conn.commit()
+            if cur.rowcount == 0:
+                return None
+        return self.get_build(build_id)
+
+    def delete_build(self, build_id: str) -> bool:
+        """Forget a build. The agent it created, and its run history, survive."""
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM builds WHERE id = ?", (build_id,))
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def sweep_abandoned_builds(self) -> list[str]:
+        """Fail builds left ``running`` by a dead process, mirroring the run sweep.
+
+        Without this a build whose process restarted claims to be in flight forever,
+        and Aperture shows a spinner with nothing behind it. The run sweep already
+        closed the trace; this closes the thing the user was actually watching.
+        """
+        with self._lock:
+            rows = self._conn.execute("SELECT id FROM builds WHERE status = 'running'").fetchall()
+            ids = [r["id"] for r in rows]
+        for build_id in ids:
+            self.update_build(
+                build_id,
+                status="failed",
+                error="abandoned: the process running this build restarted",
+            )
+        if ids:
+            logger.warning("Swept %d build(s) abandoned by a previous process", len(ids))
+        return ids
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -1143,6 +1276,19 @@ def _connection_row(row: sqlite3.Row) -> dict:
     out.pop("refresh_token", None)
     out["scopes"] = _json_list(out.pop("scopes_json", "[]"))
     out["config"] = _json_obj(out.pop("config_json", "{}"))
+    return out
+
+
+def _build_row(row: sqlite3.Row) -> dict:
+    """Project a build row, decoding both JSON columns.
+
+    ``checklist`` degrades to an empty list rather than taking down the read, the
+    same tolerance `_json_list` applies everywhere else — and it matters more here,
+    because this column holds model output.
+    """
+    out = dict(row)
+    out["checklist"] = _json_list(out.pop("checklist_json", "[]"))
+    out["done"] = [int(i) for i in _json_list(out.pop("done_json", "[]")) if isinstance(i, int)]
     return out
 
 

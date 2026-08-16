@@ -143,8 +143,8 @@ enough configs to make guessing better than asking), and not a UI.
 
 | | | |
 |---|---|---|
-| `/mcp` | `run_task`, `list_agents`, `bloom://agents` | Other agents. MCP, because a model must discover and choose. |
-| `/admin/*` | config CRUD, test-run, run history + trace, OAuth | Aperture. REST, because a GUI wants OpenAPI and a generated client. |
+| `/mcp` | `run_task`, `build_agent`, `list_agents`, `bloom://agents`, `bloom://builds` | Other agents. MCP, because a model must discover and choose. |
+| `/admin/*` | config CRUD, test-run, run history + trace, connections, builds, keywords | Aperture. REST, because a GUI wants OpenAPI and a generated client. |
 
 `BLOOM_MCP_KEYS` and `BLOOM_ADMIN_KEYS` are **separate key sets**: Aperture edits
 configuration, a peer agent spends money, and one leaked token must not buy both.
@@ -301,6 +301,69 @@ The completion page fires `aperture://oauth-complete?provider=…&status=…` *a
 renders readable text, because Aperture does not register that scheme yet. Both, so
 the flow works today and improves with no server change.
 
+### The builder — `app/builder/`
+
+The place a *description* becomes a configuration. "Create a Spotify agent" arrives
+from Aperture (`POST /admin/builder/build`) or from Amber (the `build_agent` MCP
+tool), and comes back as a real agent, its connections, and the list of things a
+human still has to do.
+
+**It is a seeded row, and privilege is its slug.** `is_builder(config)` — one line
+in `app/builder/agent.py` — is the only gate on the tools that write configurations.
+`build_runner` registers `builder_broker` *first* when that predicate holds and never
+otherwise, so nothing an operator can attach produces them: they are not derived from
+`connections` at all. Three things must fail for a normal agent to reach them: the
+`UNIQUE` index on `agent_configs.slug`, the reserved-slug validators in
+`app/admin/agents.py` (create *and* patch), and `ensure_builder_config` running in
+the lifespan before anything serves. `tests/test_builder_run.py` asserts the
+*absence* — an intersection of a normal agent's broker with `TOOL_NAMES` — because
+that is the direction that stays true only if somebody keeps checking.
+
+A row rather than a sentinel because `runs.agent_config_id` is real: a synthetic id
+would give every build a `null` slug in the activity feed and 404 the trace endpoint,
+which is the endpoint the whole feature reuses for free.
+
+**MCP-first is a procedure, not a preference.** `app/builder/mcp_registry.py` queries
+the official registry and computes a `usable` verdict, because Bloom reaches a peer
+through `MCPClient` — streamable-HTTP, `Authorization: Bearer`, nothing else. A
+package-only entry (npx/stdio), an `sse` remote, or one wanting `X-API-Key` is
+*unreachable*, and a model told merely to "prefer official servers" attaches one and
+reports success. The reason string names which, so the model stops rather than
+retries. Trust is deliberately not computed: anyone can publish there — searching
+"spotify" returns third-party trend-data servers — so the prompt tells it to judge,
+and the real protection is that nothing works until a human attaches a credential.
+
+**Everything it creates is inert, structurally.** No authoring tool has a parameter a
+secret could go in, so no credential can reach `Step.tool_calls`, the runtime's INFO
+log, or the trace — `tests/test_builder_tools.py` asserts that against the registered
+JSON schema, because the thing that would break it is somebody later adding a helpful
+`secret=`. Connections are created `pending`, including peers, overriding the
+"tokenless means active" default that is right for a URL a human typed and wrong for
+one found in a public registry.
+
+**Two ceilings.** A build is 12–25 steps against a service default of 8, so
+`build_runner` selects `builder_max_steps`/`builder_max_cost_usd` by `is_builder`.
+The invariant is unchanged — a config may lower a ceiling, never raise it — there are
+simply two, and which applies is a property of the agent. `execute_run` gained
+`timeout_s` for the same reason.
+
+**When it cannot wire something, it fails and creates nothing.** No usable MCP server
+and no shipped manifest is a deliberate outcome, not a gap: a Spotify agent that
+cannot reach Spotify is worse than none, because it looks finished.
+[docs/provider-manifests-future.md](docs/provider-manifests-future.md) records the
+options considered — runtime manifest authoring, propose-and-commit, staged approval
+— and what each would cost.
+
+### Model keywords — `app/models.py`
+
+`agent_runtime.model_router` offers three names, and a ladder can only say "better";
+it cannot say "for code". Bloom ships the ecosystem's ten keywords (Amber's
+`app/models.py` is the other half) and overlays the shared table from
+`GET {sync_store_url}/models`. **Pull-only** — Amber owns editing, via Aperture.
+`build_runner` resolves the keyword to a concrete id *before* `AgentRunner` sees it,
+because the router would raise `UnknownTier` on `coding`. Resolution never raises: an
+unreachable store keeps the table it had rather than silently re-pointing everything.
+
 ## The promise this repo does not make
 
 Every other app asserts that with the MCP flag off it never *imports* the agent
@@ -315,19 +378,27 @@ python -m venv .venv && .venv/Scripts/activate    # .venv/bin/activate on POSIX
 pip install -e ".[dev]"
 cp .env.example .env                              # BLOOM_ADMIN_KEYS at minimum
 
-pytest -q                                         # 173 tests, no network, nothing to start
+pytest -q                                         # 259 tests, no network, nothing to start
 ruff check . && ruff format --check .
 make openapi                                      # docs/openapi.json; CI fails if stale
 uvicorn app.main:app --reload --port 8010
 ```
 
+The builder additionally needs `BLOOM_OPENROUTER_API_KEY` and a Tavily
+`BLOOM_SEARCH_API_KEY`; without either, `POST /admin/builder/build` answers 503
+naming which is missing rather than letting a model write an integration from memory.
+
 Key modules: [app/config.py](app/config.py) (every knob),
 [app/db.py](app/db.py) (schema + store), [app/runtime_service.py](app/runtime_service.py)
 (config → runner → run), [app/trace.py](app/trace.py) (the trace seams),
-[app/mcp.py](app/mcp.py) (`run_task`), [app/providers/registry.py](app/providers/registry.py)
-(manifests → tools), [app/admin/connections.py](app/admin/connections.py) (the
-library), [app/credentials.py](app/credentials.py) (live credentials),
-[docs/aperture-integration.md](docs/aperture-integration.md) (the GUI contract).
+[app/mcp.py](app/mcp.py) (`run_task`, `build_agent`),
+[app/providers/registry.py](app/providers/registry.py) (manifests → tools),
+[app/admin/connections.py](app/admin/connections.py) (the library),
+[app/credentials.py](app/credentials.py) (live credentials),
+[app/builder/](app/builder/) (the agent that writes agents — `prompt.py` is its
+instructions, `tools.py` what it may write), [app/models.py](app/models.py) (model
+keywords), [docs/aperture-integration.md](docs/aperture-integration.md) (the GUI
+contract).
 
 ## Not done
 
@@ -338,7 +409,19 @@ The generic `_template.caddy` already imports `streaming`, which both `/mcp` and
 SSE trace need.
 
 **Auto-routing** (`run_task` picking the agent itself) — not until there are enough
-configs that guessing beats asking.
+configs that guessing beats asking. The builder makes this more likely to be worth
+doing, since configs are now cheap to create.
+
+**Reaching a service with no MCP server and no manifest.** The builder stops and says
+so. [docs/provider-manifests-future.md](docs/provider-manifests-future.md) is the
+written-down version of the three ways out and what each costs; the short version is
+that a model authoring the file which defines HTTP calls made with your credentials
+wants a review gate, and the review gate wants a UI that does not exist yet.
+
+**Editing an agent with the builder** (`bloom_update_agent`). Wanted, but an edit
+needs a diff view and has different failure modes from a create. Likewise multi-turn
+clarification: the builder gets one brief and must commit, because resuming would
+need conversation continuity `execute_run` does not offer.
 
 **`requires_confirmation` on `run_task`.** It is the strongest candidate in the
 ecosystem for a confirmation gate and is still unmarked: the gate is satisfied only

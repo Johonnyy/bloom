@@ -32,6 +32,9 @@ from pathlib import Path
 
 from agent_mcp import AgentMCPServer, AgentMCPSettings, current_call
 
+from app.builder import is_builder
+from app.builder.checklist import render as render_checklist
+from app.builder.service import start_build
 from app.config import Settings, get_settings
 from app.db import get_store
 from app.runtime_service import execute_run
@@ -112,6 +115,10 @@ def build_server(settings: Settings | None = None) -> AgentMCPServer:
     async def configured_agents() -> list[dict]:
         """Every configured agent: slug, name, tier, and what it can reach."""
         rows = await asyncio.to_thread(get_store().list_configs)
+        # The builder is not a specialist to delegate work to, and listing it would
+        # invite exactly the wrong call — `run_task(agent_slug="bloom-builder")`
+        # with a task rather than a brief. It is reached through `build_agent`.
+        rows = [r for r in rows if not is_builder(r)]
         # One join rather than a query per row: this endpoint builds a list, and a
         # per-agent read would scale with it.
         attached = await asyncio.to_thread(get_store().connections_by_agent)
@@ -187,6 +194,7 @@ def build_server(settings: Settings | None = None) -> AgentMCPServer:
     async def list_agents() -> str:
         """List the specialist agents available to run a task, with what each is for."""
         rows = await asyncio.to_thread(get_store().list_configs)
+        rows = [r for r in rows if not is_builder(r)]
         if not rows:
             return "No agents are configured yet."
         attached = await asyncio.to_thread(get_store().connections_by_agent)
@@ -205,6 +213,74 @@ def build_server(settings: Settings | None = None) -> AgentMCPServer:
             suffix = f" [connected: {', '.join(live)}]" if live else ""
             lines.append(f"- {r['slug']}: {r['name'] or r['slug']} — {headline}{suffix}")
         return "\n".join(lines)
+
+    @mcp.tool(read_only=False)
+    async def build_agent(brief: str) -> dict:
+        """Create a new specialist agent in Bloom from a plain-language description.
+
+        Describe what the agent should do and which service it needs to reach — "a
+        Spotify agent that can play and search music". Bloom researches the service,
+        prefers an existing MCP server over building anything itself, creates the
+        agent and its connections, and returns the setup steps a human must complete
+        before it will work.
+
+        **Relay those steps; you cannot complete them yourself.** They involve
+        registering an application and pasting a credential, which is a person at a
+        browser. The returned ``instructions`` field is written to be read aloud.
+
+        Call ``list_agents`` first. An agent that already exists should be used with
+        ``run_task``, not rebuilt.
+        """
+        settings = get_settings()
+        reason = settings.builder_unavailable_reason()
+        if reason:
+            # A value, not an exception: an ordinary return keeps the caller's turn
+            # alive and lets it tell the user what to fix.
+            return {"error": reason}
+
+        scope = current_call()
+        build = await start_build(
+            brief,
+            origin="mcp",
+            conversation_id=scope.conversation_id if scope else "",
+            depth=scope.depth if scope else 0,
+            caller=scope.caller if scope else "local",
+            settings=settings,
+        )
+        return {
+            "build_id": build["id"],
+            "run_id": build["run_id"],
+            "status": build["status"],
+            "agent_slug": build["agent_slug"],
+            "summary": build["summary"],
+            # Both shapes, on purpose. The structured list is for a client that can
+            # render a button; a model cannot click one, so the prose is what it
+            # actually uses.
+            "setup_steps": build["checklist"],
+            "instructions": render_checklist(
+                build["summary"], build["checklist"], agent_slug=build["agent_slug"]
+            ),
+            "error": build["error"],
+        }
+
+    @mcp.resource(f"{scheme}://builds")
+    async def pending_builds() -> list[dict]:
+        """Agents built but not yet live, and what each is still waiting for.
+
+        What lets a caller answer "is that Spotify agent ready yet" without being
+        told to go and look.
+        """
+        rows = await asyncio.to_thread(get_store().list_builds, status="needs_setup", limit=50)
+        return [
+            {
+                "agent_slug": r["agent_slug"],
+                "status": r["status"],
+                "summary": r["summary"],
+                "waiting_on": [s.get("title", "") for s in r["checklist"] if isinstance(s, dict)],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
 
     logger.info(
         "%s MCP server ready: %d tool(s), %d resource(s)",

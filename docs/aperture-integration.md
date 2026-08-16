@@ -2,21 +2,60 @@
 
 What Bloom's management API offers, and what Aperture has to build to use it.
 
-## Read this first: none of the Aperture side exists yet
+## Read this first: the Aperture side is built
 
-This document describes work to be done in the Aperture repo, not a capability it
-has. As of writing:
+This document used to describe work to be done. It no longer does — Aperture has the
+whole surface, and this is now a description of a contract both ends implement. What
+exists there:
 
-- **Aperture has no HTTP client of any kind.** It reaches backends two ways: one
-  WebSocket to Amber (`src/main/amber/connection.ts`) and SSH (`src/main/infra/`).
-  A `fetch`-based client layer is net-new.
-- **Aperture has no `aperture://` protocol handler.** Nothing calls
-  `setAsDefaultProtocolClient`, and the `aperture:` string in `src/shared/ipc.ts`
-  is an IPC channel prefix, not a URL scheme.
+- `src/main/bloom/` — `client.ts` (a `fetch` client over the global, no new
+  dependency), `wire.ts` (the SSE parser and the snake_case row mappers),
+  `run-stream.ts` (live tailing with `Last-Event-ID` resumption), `link.ts`,
+  `discover.ts` (finds Bloom over SSH and reads its admin key), `token-store.ts`
+  (Electron `safeStorage`), `deep-link.ts` (the `aperture://` handler).
+- `src/renderer/bloom/` — the Bloom tab: `AgentList`, `AgentEditor`, `Connections`,
+  `BuildAgent`, `SetupChecklist`, `TestRun`, `TraceView`, `RunHistory`, `Usage`.
+- `src/shared/bloom.ts` — the typed vocabulary, mirroring `docs/openapi.json`. If the
+  two disagree, that file is wrong.
 
-Bloom's side of both is finished and working. The OAuth completion page already
-fires the deep link *and* renders "you can close this tab", so the flow is usable
-today and gets better — with no server change — the day the handler is registered.
+The one thing still worth knowing: the OAuth completion page fires the deep link
+*and* renders "you can close this tab", so the flow degrades gracefully if the
+protocol registration ever fails.
+
+## The builder
+
+```
+POST   /admin/builder/build            {brief}  202 → {build_id, run_id, stream_url, trace_url}
+GET    /admin/builds                   ?limit&offset&status → Build[]
+GET    /admin/builds/{build_id}                  200 → Build
+POST   /admin/builds/{build_id}/steps/{index}/done  200 → Build
+DELETE /admin/builds/{build_id}                  204
+GET    /admin/models/keywords                    200 → {keywords[], shared, default}
+```
+
+**A build is a run**, and that is the whole integration story: `run_id` points at the
+existing `/admin/runs/{id}/events` stream and the existing trace renderer, so the
+builder needed no new transport in Aperture at all. `POST` answers 202 immediately;
+read the outcome from `/admin/builds/{id}` once the run's terminal event arrives.
+
+`Build.status` is `running | needs_setup | ready | failed`. **`failed` is sometimes
+the correct answer** — no usable MCP server and no shipped manifest means the builder
+reports what it found and creates nothing, and `summary` is where the reason lives.
+
+`checklist[]` steps are typed so a client renders each as the control that completes
+it: `connect_oauth` → the Connect button, `paste_api_key` → the secret box,
+`register_oauth_app`/`set_env` → text plus a link, `manual` → text. **An unknown
+`kind` must be coerced to `manual`, never dropped** — Bloom's `normalise_step` and
+Aperture's `toSetupStep` do exactly this, so the two ends cannot disagree about what
+a stored checklist means.
+
+`503 unavailable` from `/builder/build` means the builder is not configured, and the
+message names which of `BLOOM_FEATURE_BUILDER`, `BLOOM_OPENROUTER_API_KEY` or
+`BLOOM_SEARCH_API_KEY` is missing. Show it as a setup prompt, not an error.
+
+`AgentConfig.builtin` marks Bloom's own builder row. Its slug and prompt are defined
+in code and re-seeded at every boot, so Bloom answers `409` to an edit of either —
+show them read-only. The model keyword and the ceilings are editable.
 
 ## Connection basics
 

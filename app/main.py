@@ -26,7 +26,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.admin.agents import router as agents_router
+from app.admin.builder import router as builder_router
 from app.admin.connections import router as connections_router
+from app.admin.models import router as models_router
 from app.admin.oauth_callback import public_router as oauth_public_router
 from app.admin.runs import router as runs_router
 from app.admin.usage import router as usage_router
@@ -68,6 +70,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     from app.crypto import assert_usable
     from app.db import get_store
+    from app.models import start_keyword_sync, stop_keyword_sync
     from app.oauth.refresh import start_loop, stop_loop
     from app.trace import get_writer
 
@@ -76,9 +79,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     assert_usable(settings_now, stored_connections=await asyncio.to_thread(store.count_connections))
     await asyncio.to_thread(store.sweep_abandoned_runs)
+    # Runs and builds are swept separately because they fail differently: the run
+    # sweep closes the trace so a tailing client stops hanging, while this closes the
+    # thing the user was actually watching. A build left `running` shows a spinner
+    # with nothing behind it.
+    await asyncio.to_thread(store.sweep_abandoned_builds)
     writer = get_writer(store)
     await writer.start()
     refresher = start_loop(store, settings_now)
+
+    # Seeded before anything can serve, so the reserved slug is taken before the
+    # first request could try to claim it — see app/builder/agent.py.
+    if settings_now.feature_builder:
+        from app.builder import ensure_builder_config
+
+        await asyncio.to_thread(ensure_builder_config, store, settings_now)
+
+    keywords = start_keyword_sync(settings_now)
 
     try:
         if not get_settings().mcp_enabled:
@@ -95,6 +112,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             yield
     finally:
         await stop_loop(refresher)
+        await stop_keyword_sync(keywords)
         # Drains what is queued before stopping, so the last events of a run that
         # finished during shutdown are not lost.
         await writer.stop()
@@ -107,6 +125,8 @@ app.include_router(agents_router)
 app.include_router(runs_router)
 app.include_router(usage_router)
 app.include_router(connections_router)
+app.include_router(builder_router)
+app.include_router(models_router)
 # Unauthenticated by design — the provider redirects a browser here, which carries
 # no bearer token. Its security is a single-use state row plus PKCE. See
 # app/admin/oauth_callback.py; do not add a second route to this router.
