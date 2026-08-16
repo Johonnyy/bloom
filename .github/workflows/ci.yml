@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # This repo's default branch is `master`, not `main`. The workflow was copied
+    # from a template that assumed otherwise, so pushes matched nothing and CI
+    # simply never ran — no failure, no red X, just silence, which is the worst
+    # shape this particular bug can have.
+    branches: [master]
   pull_request:
 
 concurrency:
