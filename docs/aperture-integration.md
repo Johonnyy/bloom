@@ -276,6 +276,26 @@ reconcile, restart — for something a user should be able to do from a form. Mi
 credentials are now a `422` at create time, naming the blank field, rather than a
 `503` at the moment the browser was supposed to open.
 
+**They are also settable afterwards**, through `POST /{id}/secret`:
+
+```json
+{"client_id": "…", "client_secret": "…"}
+```
+
+Create-time only was a hole with one very specific shape: a connection Aperture did
+not create — which is *every* connection the builder makes for you — could never be
+given an app registration, so `/oauth/start` answered "no client credentials … or
+set `BLOOM_OAUTH_<PROVIDER>_CLIENT_ID`" and the environment really was the only route
+left. The id rides with the secret because `client_for` refuses to mix a connection's
+id with the environment's secret: an app registration is one intent, not two fields.
+
+Omitted means *leave alone*. `client_id: ""` **clears** it, which is how a connection
+goes back to this deployment's default — a state you have to be able to return to,
+not only leave. An empty `secret` or `client_secret` is `422`: it is always a caller
+bug, and stored it would be indistinguishable from a real credential. Client
+credentials on a non-`oauth` connection are `422` too — a peer's bearer token is
+`secret`.
+
 ### The browser handoff
 
 1. `POST /admin/connections` `{kind: "oauth", provider: "spotify", client_id, client_secret}`

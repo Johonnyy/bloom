@@ -771,8 +771,19 @@
       },
       "SecretIn": {
         "additionalProperties": false,
-        "description": "Paste or rotate one of a connection's two secrets.\n\nThey rotate on completely different schedules \u2014 the user's credential when it\nis reissued, the app's when you roll it in the provider's console \u2014 so setting\none leaves the other alone.",
+        "description": "Paste or rotate a connection's credentials.\n\nThe user's secret and the app's rotate on completely different schedules \u2014 the\nfirst when it is reissued, the second when you roll it in the provider's\nconsole \u2014 so setting one leaves the other alone.\n\n``client_id`` is not a secret and lives in ``config``, but it is accepted here\nbecause it is not independently settable: `registry.client_for` refuses to mix a\nconnection's id with the environment's secret, so the two halves of an app\nregistration are one intent and belong in one call. Sending the id alone is\nstill allowed \u2014 that is how you correct a typo without re-reading the secret out\nof a password manager.\n\n**Omitted and empty are different, and only for ``client_id``.** Omitted means\nleave it alone; ``\"\"`` means clear it, which is how a connection goes back to\nthis deployment's default \u2014 a state you have to be able to return to and not\nonly leave. An empty *secret* is refused outright: it is always a bug at the\ncaller, and storing it would look exactly like a stored credential.",
         "properties": {
+          "client_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client Id"
+          },
           "client_secret": {
             "anyOf": [
               {
@@ -2652,7 +2663,7 @@
     },
     "/admin/connections/{connection_id}/secret": {
       "post": {
-        "description": "Paste or rotate a secret. Never a PATCH, so a secret cannot ride an edit.",
+        "description": "Paste or rotate a credential. Never a PATCH, so a secret cannot ride an edit.\n\nThis is the route that makes an app registration something a user can supply\n*after* the fact. It used to be settable only at create time, which meant a\nconnection Bloom made for you \u2014 every connection the builder produces \u2014 could\nnever be given one, and the only remaining way to authorise it was an\nenvironment variable on the box: exactly the deployment operation connection-held\nclient credentials exist to avoid.",
         "operationId": "set_secret_admin_connections__connection_id__secret_post",
         "parameters": [
           {

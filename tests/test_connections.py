@@ -355,6 +355,91 @@ def test_rotating_a_client_secret_leaves_the_users_grant_alone(client):
     assert store.get_connection(connection["id"])["status"] == "active"
 
 
+def test_client_credentials_can_be_supplied_after_the_connection_exists(client):
+    """The case the builder produces: a connection nobody filled a form in for.
+
+    Without this the only way to authorise a built agent was an environment variable
+    on the box — the deployment operation connection-held credentials exist to end.
+    """
+    connection = client.post(
+        "/admin/connections", headers=AUTH, json={"kind": "oauth", "provider": "spotify"}
+    ).json()
+    assert connection["config"].get("client_id") is None
+    assert connection["has_client_secret"] is False
+
+    updated = client.post(
+        f"/admin/connections/{connection['id']}/secret",
+        headers=AUTH,
+        json={"client_id": "app-id", "client_secret": "app-secret"},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["config"]["client_id"] == "app-id"
+    assert updated.json()["has_client_secret"] is True
+    # Still pending: supplying the app registration is not the user approving it.
+    assert updated.json()["status"] == "pending"
+
+    from app.crypto import decrypt
+
+    secrets = db_module.get_store().connection_secrets(connection["id"])
+    assert decrypt(secrets["client_secret"], get_settings()) == "app-secret"
+
+
+def test_setting_a_client_id_alone_leaves_the_stored_secret_alone(client):
+    """Correcting a typo must not mean re-reading a secret out of a vault."""
+    connection = client.post(
+        "/admin/connections",
+        headers=AUTH,
+        json={"kind": "oauth", "provider": "spotify", "client_id": "typo", "client_secret": "s"},
+    ).json()
+
+    updated = client.post(
+        f"/admin/connections/{connection['id']}/secret",
+        headers=AUTH,
+        json={"client_id": "fixed"},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["config"]["client_id"] == "fixed"
+    assert updated.json()["has_client_secret"] is True
+
+    from app.crypto import decrypt
+
+    secrets = db_module.get_store().connection_secrets(connection["id"])
+    assert decrypt(secrets["client_secret"], get_settings()) == "s"
+
+
+def test_an_empty_client_id_falls_back_to_the_deployment_default(client):
+    """Clearing it is a state you must be able to return to, not only leave."""
+    connection = client.post(
+        "/admin/connections",
+        headers=AUTH,
+        json={"kind": "oauth", "provider": "spotify", "client_id": "mine", "client_secret": "s"},
+    ).json()
+
+    cleared = client.post(
+        f"/admin/connections/{connection['id']}/secret", headers=AUTH, json={"client_id": ""}
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert "client_id" not in cleared.json()["config"]
+
+    # An empty *secret* is a caller bug, not a clear: stored, it would be
+    # indistinguishable from a real one.
+    refused = client.post(
+        f"/admin/connections/{connection['id']}/secret", headers=AUTH, json={"client_secret": ""}
+    )
+    assert refused.status_code == 422
+    assert "empty" in refused.json()["message"]
+
+
+def test_client_credentials_are_refused_on_a_peer(client):
+    """A peer has no app registration; its bearer token is `secret`."""
+    peer = _peer(client)
+    refused = client.post(
+        f"/admin/connections/{peer['id']}/secret", headers=AUTH, json={"client_secret": "x"}
+    )
+    assert refused.status_code == 422
+    assert "app registration" in refused.json()["message"]
+
+
 # --- a peer needs no encryption key at all -------------------------------------
 
 

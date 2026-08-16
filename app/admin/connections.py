@@ -139,22 +139,38 @@ class ConnectionPatch(BaseModel):
 
 
 class SecretIn(BaseModel):
-    """Paste or rotate one of a connection's two secrets.
+    """Paste or rotate a connection's credentials.
 
-    They rotate on completely different schedules — the user's credential when it
-    is reissued, the app's when you roll it in the provider's console — so setting
-    one leaves the other alone.
+    The user's secret and the app's rotate on completely different schedules — the
+    first when it is reissued, the second when you roll it in the provider's
+    console — so setting one leaves the other alone.
+
+    ``client_id`` is not a secret and lives in ``config``, but it is accepted here
+    because it is not independently settable: `registry.client_for` refuses to mix a
+    connection's id with the environment's secret, so the two halves of an app
+    registration are one intent and belong in one call. Sending the id alone is
+    still allowed — that is how you correct a typo without re-reading the secret out
+    of a password manager.
+
+    **Omitted and empty are different, and only for ``client_id``.** Omitted means
+    leave it alone; ``""`` means clear it, which is how a connection goes back to
+    this deployment's default — a state you have to be able to return to and not
+    only leave. An empty *secret* is refused outright: it is always a bug at the
+    caller, and storing it would look exactly like a stored credential.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     secret: str | None = None
+    client_id: str | None = None
     client_secret: str | None = None
 
     @model_validator(mode="after")
     def _something(self) -> SecretIn:
-        if not self.secret and not self.client_secret:
-            raise ValueError("give a secret or a client_secret")
+        if not self.model_fields_set & {"secret", "client_id", "client_secret"}:
+            raise ValueError("give a secret, a client_id or a client_secret")
+        if self.secret == "" or self.client_secret == "":
+            raise ValueError("a secret cannot be empty; omit it to leave the stored one alone")
         return self
 
 
@@ -500,7 +516,15 @@ async def connection_agents(connection_id: str) -> list[dict]:
 
 @router.post("/connections/{connection_id}/secret", response_model=ConnectionOut)
 async def set_secret(connection_id: str, body: SecretIn) -> ConnectionOut:
-    """Paste or rotate a secret. Never a PATCH, so a secret cannot ride an edit."""
+    """Paste or rotate a credential. Never a PATCH, so a secret cannot ride an edit.
+
+    This is the route that makes an app registration something a user can supply
+    *after* the fact. It used to be settable only at create time, which meant a
+    connection Bloom made for you — every connection the builder produces — could
+    never be given one, and the only remaining way to authorise it was an
+    environment variable on the box: exactly the deployment operation connection-held
+    client credentials exist to avoid.
+    """
     _require_secrets_storable()
     store = get_store()
     row = await _require_connection(store, connection_id)
@@ -513,6 +537,26 @@ async def set_secret(connection_id: str, body: SecretIn) -> ConnectionOut:
             "An OAuth connection's access token comes from the provider, not from you. "
             "Use /oauth/start to authorise it.",
         )
+    if (body.client_id or body.client_secret) and row["kind"] != "oauth":
+        raise ApiError(
+            422,
+            "unprocessable",
+            f"A {row['kind']} connection has no app registration — client credentials "
+            "belong to an oauth connection. Use 'secret' for its own credential.",
+        )
+
+    # Config first, so the row returned below carries both halves. `client_id` is a
+    # config key rather than a column, and an empty string clears it: a connection
+    # with an id and no secret would otherwise be indistinguishable from one that
+    # deliberately falls back to this deployment's default.
+    if body.client_id is not None:
+        config = dict(row["config"] or {})
+        client_id = body.client_id.strip()
+        if client_id:
+            config["client_id"] = client_id
+        else:
+            config.pop("client_id", None)
+        await asyncio.to_thread(store.update_connection, connection_id, config=config)
 
     updated = await asyncio.to_thread(
         store.set_connection_secret,

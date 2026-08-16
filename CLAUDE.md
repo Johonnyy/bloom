@@ -256,7 +256,11 @@ Three things this bought, none of which needed new machinery:
   `registry.client_for` resolves connection-first, environment-second, so an
   existing deployment keeps working and a shared registration is still possible.
   That panel, its `dynamic_keys` manifest stanza and the `fillCredentials` SSH
-  action are all deleted.
+  action are all deleted. `POST /admin/connections/{id}/secret` takes `client_id`
+  alongside `client_secret`, so a connection **Bloom** created — every one the
+  builder makes — can be given an app registration afterwards. Create-time-only was
+  the half of this that was still a deployment operation, and it had no symptom
+  beyond `/oauth/start` naming an environment variable.
 
 The tradeoff worth knowing: an app client secret now sits in `bloom.db`, under the
 same Fernet key that already protects the user's access *and refresh* tokens for
