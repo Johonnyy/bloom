@@ -143,8 +143,8 @@ enough configs to make guessing better than asking), and not a UI.
 
 | | | |
 |---|---|---|
-| `/mcp` | `run_task`, `build_agent`, `list_agents`, `bloom://agents`, `bloom://builds` | Other agents. MCP, because a model must discover and choose. |
-| `/admin/*` | config CRUD, test-run, run history + trace, connections, builds, keywords | Aperture. REST, because a GUI wants OpenAPI and a generated client. |
+| `/mcp` | `run_task`, `build_agent`, `edit_agent`, `list_agents`, `bloom://agents`, `bloom://builds` | Other agents. MCP, because a model must discover and choose. |
+| `/admin/*` | config CRUD, test-run, run history + trace, connections, builds, provider manifests, keywords | Aperture. REST, because a GUI wants OpenAPI and a generated client. |
 
 `BLOOM_MCP_KEYS` and `BLOOM_ADMIN_KEYS` are **separate key sets**: Aperture edits
 configuration, a peer agent spends money, and one leaked token must not buy both.
@@ -324,6 +324,43 @@ from Aperture (`POST /admin/builder/build`) or from Amber (the `build_agent` MCP
 tool), and comes back as a real agent, its connections, and the list of things a
 human still has to do.
 
+**It edits as well as creates, and that is not a convenience.** "Let the Spotify
+agent skip tracks" used to be unanswerable: the builder could only create, so the
+only offer available was a second agent — which cannot work, because a new agent
+attached to the same connection inherits the same OAuth grant. A permission is a
+property of the *connection*, not of the agent. `POST /admin/builder/edit` and the
+`edit_agent` MCP tool take a slug and a plain-language change; `bloom_get_agent`,
+`bloom_update_agent`, `bloom_detach_connection`, `bloom_set_connection_scopes` and
+`bloom_authorize_connection` are what the builder does it with. Both the tool
+descriptions and the prompt name the rebuild as *the wrong move*, rather than merely
+offering the right one — it is what a model reaches for unprompted.
+
+An edit is a `builds` row with `mode='edit'` (schema v2), so it reuses the trace,
+the SSE stream and the checklist unchanged. Two things differ, both in
+`app/builder/service.py`:
+
+* **it is settled from `changes`, not from `agent_config_id`.** A build is judged by
+  whether an agent exists afterwards; an edit cannot be, because it existed
+  beforehand. Each write tool appends a line, and an edit that appended none is
+  `failed` however cheerfully the model summarised it;
+* **its checklist counts toward the status.** A build's connections are freshly
+  created and therefore `pending`, so `_all_active` settles it correctly. An edit's
+  are usually already `active` and *stay* active after a scope change — a token
+  keeps the grant it was issued with — so an outstanding non-`manual` step is what
+  makes it `needs_setup`. Downgrading a re-scoped connection to `pending` instead
+  would strip every one of that agent's tools until someone came back: breaking a
+  working agent to signal that it is about to become more capable.
+
+**The builder cannot edit the builder.** `_reject_builder` refuses `BUILDER_SLUG` on
+every write path in `app/builder/tools.py`, and `resolve_edit_target` refuses it
+before a run starts. That was implicit while the builder could only create — the
+`UNIQUE` index refuses a second row with that slug — and stopped being implicit the
+moment it could write to an existing one. It is now the fourth lock on a model
+rewriting its own instructions, and the one that would otherwise have gone missing.
+There is also no slug-rename parameter: a slug is how `run_task` names an agent and
+how every past build refers to it, so a model rebinding one breaks callers nowhere
+near the run. Aperture's `PATCH /admin/agents/{id}` still allows it.
+
 **It is a seeded row, and privilege is its slug.** `is_builder(config)` — one line
 in `app/builder/agent.py` — is the only gate on the tools that write configurations.
 `build_runner` registers `builder_broker` *first* when that predicate holds and never
@@ -363,12 +400,64 @@ The invariant is unchanged — a config may lower a ceiling, never raise it — 
 simply two, and which applies is a property of the agent. `execute_run` gained
 `timeout_s` for the same reason.
 
-**When it cannot wire something, it fails and creates nothing.** No usable MCP server
-and no shipped manifest is a deliberate outcome, not a gap: a Spotify agent that
-cannot reach Spotify is worse than none, because it looks finished.
-[docs/provider-manifests-future.md](docs/provider-manifests-future.md) records the
-options considered — runtime manifest authoring, propose-and-commit, staged approval
-— and what each would cost.
+**When it cannot wire something, it fails and creates nothing.** Now only when the
+API is genuinely undocumented — a manifest written from guesses is worse than none,
+because it looks finished and fails later with a credential attached.
+
+### Provider manifests are written at runtime — `app/manifests.py`
+
+**Shipping a manifest per OAuth service does not scale, so the builder writes them.**
+That was the last thing in Bloom that made adding a capability a pull request and a
+redeploy, which contradicts the whole premise — a capability is a row in a table. The
+builder researches the API with `read_url`, calls `bloom_list_manifest_format`, and
+writes with `bloom_write_provider_manifest`; the manifest is live in the same run, so
+it can create the connection immediately rather than reporting success and waiting
+for a restart. Two files remain in `app/providers/` as reference implementations, and
+`providers()` unions them with stored rows.
+
+**A manifest is not inert data**, which is the whole difficulty:
+`register_operations` turns each entry into a callable tool and `CredentialResolver`
+attaches a live token to every request it makes. Four things pay for the trade, and
+[docs/provider-manifests-future.md](docs/provider-manifests-future.md) prices each:
+
+1. `load_manifest_text(trusted=False)` — endpoints must be https and pass the SSRF
+   check `read_url` uses, no `DELETE`, ≤20 operations, ≤16 KB, on top of every rule a
+   file manifest already passed. The metadata-service case is the one that matters:
+   without it, a manifest naming `169.254.169.254` turns the credential resolver into
+   an authenticated client of the instance's own identity service;
+2. **a file always wins** — enforced at the write path (`writable_name`) *and* in
+   `providers()`, in two modules, because only one of them is on the path a manifest
+   arriving from the sync store takes. A stored row cannot repoint `spotify`, which
+   is the attack needing no new credential at all;
+3. **the credential is the real gate**, and it always was — a manifest does nothing
+   until a human attaches an account. What that human lacked was the one checkable
+   fact, which `ConnectionOut.credential_hosts` now carries: "your key will be sent to
+   api.example.com" is something they can compare against the service they meant;
+4. **verification** — validation proves a manifest parses, never that its `api_base`
+   is real. A successful `POST /connections/{id}/test` is the only evidence there is,
+   and it marks the manifest verified. Anything unverified says so.
+
+**`PUT /admin/manifests/{name}` is the acceptance criterion, not a convenience.** A
+model-authored operation will sometimes be wrong, and if fixing it meant editing TOML
+in the repo, this would have traded "open the editor to add a provider" for "open the
+editor to fix one" — the same editor. Correcting one is a form. `DELETE` leaves
+connections and their credentials alone, so "delete it and let the builder retry" is
+recovery rather than destruction.
+
+**`allow_request` is the honest way out of a hard API.** A manifest may declare a
+bounded `<provider>_request` tool — `safe_path` locks it to `api_base`, no `DELETE` —
+for services too irregular to model as operations. `app/providers/registry.py` rejects
+a generic request tool in its own docstring, and that reasoning assumed the
+alternative was a *human*-written manifest; when both are model-written the choice
+becomes "guessing at authoring time, frozen" versus "guessing at call time,
+correctable". Declared operations are still better and still preferred. This exists so
+an irregular API produces a working agent instead of four operations that all 400.
+
+Manifests travel through the sync store's `/manifests` (`app/manifest_sync.py`), so
+research done on one install is not repeated on the next. The store treats the TOML as
+opaque and does not parse it, so a pulled manifest is untrusted input and goes through
+`trusted=False` like any other. **Local always wins** — a pull never overwrites what
+this install has, which is what keeps the `PUT` above trustworthy.
 
 ### Model keywords — `app/models.py`
 
@@ -394,21 +483,26 @@ python -m venv .venv && .venv/Scripts/activate    # .venv/bin/activate on POSIX
 pip install -e ".[dev]"
 cp .env.example .env                              # BLOOM_ADMIN_KEYS at minimum
 
-pytest -q                                         # 259 tests, no network, nothing to start
+pytest -q                                         # 342 tests, no network, nothing to start
 ruff check . && ruff format --check .
 make openapi                                      # docs/openapi.json; CI fails if stale
 uvicorn app.main:app --reload --port 8010
 ```
 
 The builder additionally needs `BLOOM_OPENROUTER_API_KEY` and a Tavily
-`BLOOM_SEARCH_API_KEY`; without either, `POST /admin/builder/build` answers 503
-naming which is missing rather than letting a model write an integration from memory.
+`BLOOM_SEARCH_API_KEY`; without either, `POST /admin/builder/build` and
+`/admin/builder/edit` answer 503 naming which is missing rather than letting a model
+write an integration from memory. `bloom_authorize_connection` further needs
+`BLOOM_FEATURE_OAUTH` and `BLOOM_FERNET_KEYS`, and says so as a checklist step
+instead of minting a link it could not store the resulting token for.
 
 Key modules: [app/config.py](app/config.py) (every knob),
 [app/db.py](app/db.py) (schema + store), [app/runtime_service.py](app/runtime_service.py)
 (config → runner → run), [app/trace.py](app/trace.py) (the trace seams),
-[app/mcp.py](app/mcp.py) (`run_task`, `build_agent`),
+[app/mcp.py](app/mcp.py) (`run_task`, `build_agent`, `edit_agent`),
 [app/providers/registry.py](app/providers/registry.py) (manifests → tools),
+[app/manifests.py](app/manifests.py) (manifests written at runtime) and
+[app/manifest_sync.py](app/manifest_sync.py) (sharing them),
 [app/admin/connections.py](app/admin/connections.py) (the library),
 [app/credentials.py](app/credentials.py) (live credentials),
 [app/builder/](app/builder/) (the agent that writes agents — `prompt.py` is its
@@ -434,10 +528,17 @@ written-down version of the three ways out and what each costs; the short versio
 that a model authoring the file which defines HTTP calls made with your credentials
 wants a review gate, and the review gate wants a UI that does not exist yet.
 
-**Editing an agent with the builder** (`bloom_update_agent`). Wanted, but an edit
-needs a diff view and has different failure modes from a create. Likewise multi-turn
-clarification: the builder gets one brief and must commit, because resuming would
-need conversation continuity `execute_run` does not offer.
+**A diff view for an edit.** Editing itself is done (see above); what an edit does
+not have is a *preview*. It writes, then reports. `builds.changes` is the record
+after the fact, which is enough to see what happened and not enough to approve it
+first — and approval needs the same missing `X-Confirmed` channel as everything
+else below.
+
+**Multi-turn clarification.** The builder gets one brief and must commit, whether
+building or editing, because resuming would need conversation continuity
+`execute_run` does not offer. An ambiguous edit brief is answered by guessing, which
+is why `changes` exists and why the prompt tells it not to touch what was not asked
+about.
 
 **`requires_confirmation` on `run_task`.** It is the strongest candidate in the
 ecosystem for a confirmation gate and is still unmarked: the gate is satisfied only

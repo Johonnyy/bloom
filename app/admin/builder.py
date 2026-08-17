@@ -23,7 +23,7 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.admin.deps import require_admin
-from app.builder.service import start_build
+from app.builder.service import UnknownAgent, edit_brief, resolve_edit_target, start_build
 from app.config import get_settings
 from app.db import get_store
 from app.errors import ApiError
@@ -48,10 +48,32 @@ class BuildIn(BaseModel):
     )
 
 
+class EditIn(BaseModel):
+    """A change to an agent that already exists.
+
+    Separate from :class:`BuildIn` rather than a ``mode`` field on it, because the
+    two carry different information: an edit must name its target, and a build must
+    not. A single model would make ``agent_slug`` optional and push the "required
+    when mode is edit" rule into a validator nobody reads.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_slug: str = Field(description="The agent to change, e.g. 'spotify-dj'.")
+    change: str = Field(
+        min_length=3,
+        max_length=4000,
+        description=(
+            "Plain language: 'let it skip tracks', 'stop it answering questions about billing'."
+        ),
+    )
+
+
 class BuildStarted(BaseModel):
     build_id: str
     run_id: str
     status: str
+    mode: str = "build"
     # Relative paths, like test-run's. Join them to the base URL rather than using
     # them directly.
     stream_url: str
@@ -72,11 +94,15 @@ class BuildOut(BaseModel):
     id: str
     run_id: str
     brief: str
+    mode: str = "build"
     agent_config_id: str | None
     agent_slug: str
     status: str
     summary: str
     checklist: list[SetupStep]
+    # What an edit actually altered, one line each. Empty for a build, whose
+    # evidence of work is the agent it left behind.
+    changes: list[str] = []
     done: list[int]
     error: str | None
     created_at: str
@@ -139,12 +165,57 @@ async def build(body: BuildIn, caller: str = Depends(require_admin)) -> BuildSta
     )
 
 
-async def _run_build(build_id: str, run_id: str, brief: str, caller: str) -> None:
+@router.post("/builder/edit", response_model=BuildStarted, status_code=202)
+async def edit(body: EditIn, caller: str = Depends(require_admin)) -> BuildStarted:
+    """Change an agent that already exists, using the same builder and the same trace.
+
+    Shaped exactly like ``/builder/build`` — 202 and a stream URL — so Aperture
+    reuses the build panel it already has rather than growing a second one.
+
+    The slug is resolved *here*, synchronously, so an unknown agent is a 404 before
+    anything is spent. Everything after that point costs a builder run.
+    """
+    _require_available()
+    store = get_store()
+
+    try:
+        agent = await asyncio.to_thread(resolve_edit_target, body.agent_slug, store)
+    except UnknownAgent as exc:
+        raise ApiError(404, "not_found", str(exc)) from exc
+
+    from app.builder.agent import ensure_builder_config
+    from app.db import new_id
+
+    await asyncio.to_thread(ensure_builder_config, store, get_settings())
+    build_id, run_id = new_id(), new_id()
+
+    task = asyncio.create_task(
+        _run_build(build_id, run_id, edit_brief(agent["slug"], body.change), caller, agent),
+        name=f"bloom-edit-{build_id}",
+    )
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
+
+    return BuildStarted(
+        build_id=build_id,
+        run_id=run_id,
+        status="running",
+        mode="edit",
+        stream_url=f"/admin/runs/{run_id}/events",
+        trace_url=f"/admin/builds/{build_id}",
+    )
+
+
+async def _run_build(
+    build_id: str, run_id: str, brief: str, caller: str, agent: dict | None = None
+) -> None:
     """Body of the background task. Every failure is already recorded on the row."""
     try:
         await start_build(
             brief,
-            origin="build",
+            origin="edit" if agent else "build",
+            mode="edit" if agent else "build",
+            agent=agent,
             caller=caller,
             build_id=build_id,
             run_id=run_id,
@@ -160,10 +231,15 @@ async def list_builds(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     status: str | None = Query(None, description="running | needs_setup | ready | failed"),
+    mode: str | None = Query(None, description="build | edit"),
 ) -> list[BuildOut]:
-    """Builds, newest first. Filter by status to find what still needs a credential."""
+    """Builds, newest first. Filter by status to find what still needs a credential.
+
+    ``mode='edit'`` is an agent's change history — what has been altered since it was
+    built, and by which run.
+    """
     rows = await asyncio.to_thread(
-        get_store().list_builds, limit=limit, offset=offset, status=status
+        get_store().list_builds, limit=limit, offset=offset, status=status, mode=mode
     )
     return [BuildOut(**r) for r in rows]
 

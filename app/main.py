@@ -28,6 +28,7 @@ from fastapi import FastAPI
 from app.admin.agents import router as agents_router
 from app.admin.builder import router as builder_router
 from app.admin.connections import router as connections_router
+from app.admin.manifests import router as manifests_router
 from app.admin.models import router as models_router
 from app.admin.oauth_callback import public_router as oauth_public_router
 from app.admin.runs import router as runs_router
@@ -78,6 +79,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     store = get_store()
 
     assert_usable(settings_now, stored_connections=await asyncio.to_thread(store.count_connections))
+
+    # Before anything reads `providers()`: a provider is now a shipped file *or* a
+    # stored row, and a connection resolved against the file-only view would report
+    # "no manifest for that provider" for one the builder wrote last week.
+    from app.manifests import install_loader
+
+    install_loader(store)
+
     await asyncio.to_thread(store.sweep_abandoned_runs)
     # Runs and builds are swept separately because they fail differently: the run
     # sweep closes the trace so a tailing client stops hanging, while this closes the
@@ -96,6 +105,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await asyncio.to_thread(ensure_builder_config, store, settings_now)
 
     keywords = start_keyword_sync(settings_now)
+    from app.manifest_sync import start_manifest_sync, stop_manifest_sync
+
+    shared_manifests = start_manifest_sync(settings_now)
 
     try:
         if not get_settings().mcp_enabled:
@@ -113,6 +125,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         await stop_loop(refresher)
         await stop_keyword_sync(keywords)
+        await stop_manifest_sync(shared_manifests)
         # Drains what is queued before stopping, so the last events of a run that
         # finished during shutdown are not lost.
         await writer.stop()
@@ -126,6 +139,7 @@ app.include_router(runs_router)
 app.include_router(usage_router)
 app.include_router(connections_router)
 app.include_router(builder_router)
+app.include_router(manifests_router)
 app.include_router(models_router)
 # Unauthenticated by design — the provider redirects a browser here, which carries
 # no bearer token. Its security is a single-use state row plus PKCE. See

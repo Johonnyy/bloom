@@ -233,6 +233,21 @@ class ConnectionOut(BaseModel):
     updated_at: str
     agent_ids: list[str]
     tools: list[str]
+    # --- what a person needs to know before pasting a credential ---------------
+    #
+    # A provider is no longer necessarily reviewed code: the builder writes
+    # manifests now, from a service's own documentation, and a manifest is what
+    # decides where this connection's credential gets sent. These three fields are
+    # the whole trust gate, and they are *here* rather than on a settings page
+    # because this is the object the credential form is bound to. A warning
+    # somewhere else is a warning nobody sees.
+    #
+    # `credential_hosts` is the fact a person can actually check: not "read this
+    # 90-line TOML document" but "your key will be sent to api.example.com", which
+    # they can compare against the service they think they are connecting to.
+    provider_source: str = "file"
+    provider_reviewed: bool = True
+    credential_hosts: list[str] = Field(default_factory=list)
 
 
 # --- helpers -------------------------------------------------------------------
@@ -258,7 +273,17 @@ def _tools_for(row: dict) -> list[str]:
 
 async def _out(store: Store, row: dict) -> ConnectionOut:
     agents = await asyncio.to_thread(store.agents_for_connection, row["id"])
-    return ConnectionOut(**row, agent_ids=[a["id"] for a in agents], tools=_tools_for(row))
+    provider = get_provider(row.get("provider") or "")
+    return ConnectionOut(
+        **row,
+        agent_ids=[a["id"] for a in agents],
+        tools=_tools_for(row),
+        # A peer has no manifest and no provider, so it keeps the reviewed default:
+        # its URL was typed by a human, which is the same guarantee.
+        provider_source=provider.source if provider else "file",
+        provider_reviewed=provider.reviewed if provider else True,
+        credential_hosts=list(provider.credential_hosts()) if provider else [],
+    )
 
 
 async def _require_connection(store: Store, connection_id: str) -> dict:
@@ -697,6 +722,29 @@ async def _probe_provider(row: dict, store: Store) -> ProbeOut:
         detail = f"{provider.display_name} accepted the credential."
     else:
         detail = f"{provider.display_name} answered HTTP {response.status_code}."
+
+    # A successful probe is the only evidence a *stored* manifest was written
+    # correctly. Nothing else can be: a manifest is validated at load, which proves
+    # it parses and is safely shaped, not that its `api_base` and its probe path
+    # describe a real API. This is where the two facts finally meet — a live
+    # credential and the manifest's own declared request — so it is where a
+    # model-authored provider stops being unproven.
+    #
+    # It happens here rather than in a builder tool because it *cannot* happen
+    # during a build: the manifest is written before a credential exists, and the
+    # human who supplies one is the first person able to prove anything.
+    if ok and not provider.reviewed:
+        from app import manifests
+
+        await asyncio.to_thread(
+            manifests.mark_verified,
+            provider.name,
+            note=f"{provider.probe.method if provider.probe else 'GET'} probe returned "
+            f"{response.status_code}",
+            store=store,
+        )
+        logger.info("Stored manifest %s verified by a live probe", provider.name)
+
     return ProbeOut(ok=ok, checked="request", status=response.status_code, detail=detail)
 
 

@@ -304,9 +304,42 @@ def _migrate_to_connections(conn: sqlite3.Connection, peers: dict[str, dict]) ->
         )
 
 
+def _migrate_builds_mode(conn: sqlite3.Connection, peers: dict[str, dict]) -> None:
+    """v2 — ``builds`` gains ``mode`` and ``changes_json``, so an edit is a real build.
+
+    Two added columns and no data movement: every existing row is a build, which is
+    exactly what the ``DEFAULT 'build'`` says, and no build made before this ever
+    edited anything, which is what the empty change list says. Both defaults are
+    therefore true statements about the history rather than a convenient fiction.
+
+    Guarded on ``PRAGMA table_info`` rather than trusting the version row, because a
+    file created fresh after this shipped already has both columns from ``_SCHEMA``
+    and ``ALTER TABLE`` has no ``IF NOT EXISTS``.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(builds)")}
+    if "mode" not in columns:
+        conn.execute("ALTER TABLE builds ADD COLUMN mode TEXT NOT NULL DEFAULT 'build'")
+    if "changes_json" not in columns:
+        conn.execute("ALTER TABLE builds ADD COLUMN changes_json TEXT NOT NULL DEFAULT '[]'")
+    conn.commit()
+
+
+def _migrate_provider_manifests(conn: sqlite3.Connection, peers: dict[str, dict]) -> None:
+    """v3 — nothing to move; the table is created by ``_SCHEMA`` on every open.
+
+    Recorded as a migration anyway so the version number advances and a database
+    opened by an older build is distinguishable from one that simply has no
+    manifests yet. ``CREATE TABLE IF NOT EXISTS`` has already run by the time
+    migrations are applied, which is why this has no DDL of its own.
+    """
+    conn.commit()
+
+
 # Ordered, and applied in order. Append; never renumber.
 _MIGRATIONS: tuple[tuple[int, str, Callable[[sqlite3.Connection, dict[str, dict]], None]], ...] = (
     (1, "connections replace oauth_connections and mcp_servers", _migrate_to_connections),
+    (2, "builds carry a mode and a change list", _migrate_builds_mode),
+    (3, "provider manifests can be stored, not only shipped", _migrate_provider_manifests),
 )
 
 
@@ -439,8 +472,14 @@ CREATE TABLE IF NOT EXISTS builds (
     agent_slug      TEXT    NOT NULL DEFAULT '',
     status          TEXT    NOT NULL,
         -- running | needs_setup | ready | failed
+    mode            TEXT    NOT NULL DEFAULT 'build',
+        -- build | edit. An edit reuses this table because it is the same builder,
+        -- the same trace and the same checklist; what differs is that the agent
+        -- already existed, so `agent_config_id` is set before the run rather than
+        -- by it, and `changes_json` — not that column — is the evidence of work.
     summary         TEXT    NOT NULL DEFAULT '',
     checklist_json  TEXT    NOT NULL DEFAULT '[]',
+    changes_json    TEXT    NOT NULL DEFAULT '[]',   -- what an edit actually altered
     done_json       TEXT    NOT NULL DEFAULT '[]',   -- indexes ticked off
     error           TEXT,
     created_at      TEXT    NOT NULL,
@@ -448,6 +487,36 @@ CREATE TABLE IF NOT EXISTS builds (
 );
 CREATE INDEX IF NOT EXISTS idx_builds_run ON builds (run_id);
 CREATE INDEX IF NOT EXISTS idx_builds_status ON builds (status, created_at DESC);
+
+-- Provider manifests written at runtime rather than shipped as files.
+--
+-- A row here, not a file in `app/providers/`. That directory is inside the code
+-- tree, so model output written there is destroyed by the next image rebuild; and
+-- `data/` is the only mounted volume and the only thing `backup-sqlite.sh` covers,
+-- so a second writable directory needs a second volume and a second backup path and
+-- gets silently lost the first time someone forgets one. The table also carries
+-- `run_id` and `created_at` for free, and for a model-authored definition "which run
+-- wrote this" is the first question anyone asks.
+--
+-- `name` is UNIQUE, and a file-shipped manifest of the same name always wins when
+-- both exist — enforced at the write path and again in `providers()`.
+--
+-- `verified_at` records that the manifest was proved against the real API rather
+-- than merely parsed. A provider that has never answered a request is not a broken
+-- one, it is an unproven one, and the difference is worth showing rather than
+-- discovering when an agent's tool 400s in front of a user.
+CREATE TABLE IF NOT EXISTS provider_manifests (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL UNIQUE,
+    toml          TEXT NOT NULL,
+    source        TEXT NOT NULL DEFAULT 'stored',   -- stored | shared
+    run_id        TEXT NOT NULL DEFAULT '',         -- the build that wrote it
+    verified_at   TEXT,                             -- NULL until proved live
+    verified_note TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_manifests_name ON provider_manifests (name);
 
 CREATE TABLE IF NOT EXISTS run_events (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,  -- the SSE cursor / Last-Event-ID
@@ -1360,19 +1429,119 @@ class Store:
 
     # --- builds ----------------------------------------------------------------
 
-    def create_build(self, *, build_id: str, run_id: str, brief: str) -> dict:
+    # --- provider manifests ---------------------------------------------------
+
+    def upsert_manifest(
+        self,
+        *,
+        name: str,
+        toml: str,
+        source: str = "stored",
+        run_id: str = "",
+        manifest_id: str | None = None,
+    ) -> dict:
+        """Write a manifest, replacing any row of the same name.
+
+        Upsert rather than insert-or-fail because rewriting is the ordinary case:
+        the builder fixes an operation it got wrong, a human corrects one in
+        Aperture, the sync store sends a newer copy. A name is the provider's
+        identity, so two rows for one name is never the intent.
+
+        **Rewriting clears ``verified_at``.** The proof belonged to the previous
+        text; carrying it over would let one verified operation certify a manifest
+        that has since been rewritten around it.
+        """
+        now = _now()
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT id, created_at FROM provider_manifests WHERE name = ?", (name,)
+            ).fetchone()
+            row_id = manifest_id or (existing["id"] if existing else new_id())
+            created = existing["created_at"] if existing else now
+            self._conn.execute(
+                "INSERT INTO provider_manifests "
+                "(id, name, toml, source, run_id, verified_at, verified_note, "
+                " created_at, updated_at) "
+                "VALUES (?,?,?,?,?, NULL, '', ?,?) "
+                "ON CONFLICT(name) DO UPDATE SET "
+                "  toml = excluded.toml, source = excluded.source, "
+                "  run_id = excluded.run_id, verified_at = NULL, verified_note = '', "
+                "  updated_at = excluded.updated_at",
+                (row_id, name, toml, source, run_id, created, now),
+            )
+            self._conn.commit()
+        return self.get_manifest(name)  # type: ignore[return-value]
+
+    def get_manifest(self, name: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM provider_manifests WHERE name = ?", (name,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_manifests(self) -> list[dict]:
+        """Every stored manifest, by name. Small by nature — no paging."""
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM provider_manifests ORDER BY name").fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_manifest_verified(self, name: str, *, note: str = "") -> dict | None:
+        """Record that this manifest answered a real request."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE provider_manifests SET verified_at = ?, verified_note = ?, "
+                "updated_at = ? WHERE name = ?",
+                (_now(), note[:500], _now(), name),
+            )
+            self._conn.commit()
+            if cur.rowcount == 0:
+                return None
+        return self.get_manifest(name)
+
+    def delete_manifest(self, name: str) -> bool:
+        """Forget a stored manifest. Connections using it survive as rows.
+
+        Deliberately not cascading into ``connections``: a credential the user
+        pasted is theirs, and deleting a definition that turned out to be wrong
+        should not also throw away the account they connected. The connection's
+        tools simply stop being registered until a manifest for the name exists
+        again — which is what makes "delete it and let the builder retry" a safe
+        recovery rather than a destructive one.
+        """
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM provider_manifests WHERE name = ?", (name,))
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def create_build(
+        self,
+        *,
+        build_id: str,
+        run_id: str,
+        brief: str,
+        mode: str = "build",
+        agent_config_id: str | None = None,
+        agent_slug: str = "",
+    ) -> dict:
         """Open a build in ``running`` state.
 
         Committed *before* the run starts, the same ordering and for the same reason
         as :meth:`create_run`: a client that posted a brief needs something to attach
         to while the work is still in flight.
+
+        An ``edit`` names its target agent here rather than learning it from the run.
+        The caller has already resolved the slug — refusing an unknown one before
+        spending anything is the point — and writing it now means a run that dies
+        early still leaves a row saying which agent was being edited.
         """
         now = _now()
         with self._lock:
             self._conn.execute(
-                "INSERT INTO builds (id, run_id, brief, status, created_at, updated_at) "
-                "VALUES (?,?,?, 'running', ?,?)",
-                (build_id, run_id, brief, now, now),
+                "INSERT INTO builds "
+                "(id, run_id, brief, mode, agent_config_id, agent_slug, status, "
+                " created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?, 'running', ?,?)",
+                (build_id, run_id, brief, mode, agent_config_id, agent_slug, now, now),
             )
             self._conn.commit()
         return self.get_build(build_id)  # type: ignore[return-value]
@@ -1389,11 +1558,28 @@ class Store:
         return _build_row(row) if row else None
 
     def list_builds(
-        self, *, limit: int = 50, offset: int = 0, status: str | None = None
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        status: str | None = None,
+        mode: str | None = None,
     ) -> list[dict]:
-        """Builds, newest first. ``status`` narrows to e.g. everything still unfinished."""
-        clause = "WHERE status = ?" if status else ""
-        params: list[Any] = [status] if status else []
+        """Builds, newest first. ``status`` narrows to e.g. everything still unfinished.
+
+        ``mode`` separates the two kinds: "what have I built" and "what has been
+        changed since" are different questions, and an agent's edit history is the
+        second one.
+        """
+        where: list[str] = []
+        params: list[Any] = []
+        if status:
+            where.append("status = ?")
+            params.append(status)
+        if mode:
+            where.append("mode = ?")
+            params.append(mode)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
         params.extend([max(1, min(limit, 200)), max(0, offset)])
         with self._lock:
             rows = self._conn.execute(
@@ -1405,8 +1591,12 @@ class Store:
     def update_build(self, build_id: str, **fields: Any) -> dict | None:
         """Patch a build. ``None`` means leave alone, never clear.
 
-        ``checklist`` and ``done`` are taken as Python lists and stored as JSON; the
-        rest are plain columns.
+        ``checklist``, ``changes`` and ``done`` are taken as Python lists and stored
+        as JSON; the rest are plain columns.
+
+        ``mode`` is deliberately not editable. It is decided by whoever opened the
+        row, and a build that could turn into an edit halfway through would make
+        `_settle`'s two rules disagree about which one applied.
         """
         editable = {"agent_config_id", "agent_slug", "status", "summary", "error"}
         sets: list[str] = []
@@ -1417,6 +1607,9 @@ class Store:
             if key == "checklist":
                 sets.append("checklist_json = ?")
                 values.append(json.dumps(list(value)))
+            elif key == "changes":
+                sets.append("changes_json = ?")
+                values.append(json.dumps([str(c) for c in value]))
             elif key == "done":
                 sets.append("done_json = ?")
                 values.append(json.dumps(sorted({int(i) for i in value})))
@@ -1504,6 +1697,7 @@ def _build_row(row: sqlite3.Row) -> dict:
     """
     out = dict(row)
     out["checklist"] = _json_list(out.pop("checklist_json", "[]"))
+    out["changes"] = [str(c) for c in _json_list(out.pop("changes_json", "[]"))]
     out["done"] = [int(i) for i in _json_list(out.pop("done_json", "[]")) if isinstance(i, int)]
     return out
 

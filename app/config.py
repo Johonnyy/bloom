@@ -143,6 +143,18 @@ class Settings(BaseSettings):
     # per app. With no sync store configured Bloom simply uses its built-ins.
     model_sync_interval_s: float = 300.0
 
+    # Provider manifests travel the same way, through the same store — see
+    # `app/manifest_sync.py`. Slower than the keyword table on purpose: a keyword is
+    # re-pointed by hand and the change is wanted now, while a manifest appears when
+    # some install's builder happens to research a new service. Local edits always
+    # win, so nothing here can undo a correction made in Aperture.
+    manifest_sync_interval_s: float = 900.0
+    # Off pins this install to the manifests it wrote itself. The switch exists for
+    # the same reason Amber's peer discovery has one: when a shared definition is
+    # sending a credential somewhere it should not, you want one setting that stops
+    # consuming without also losing what you built locally.
+    feature_manifest_sync: bool = True
+
     # --- The builder: the agent that writes other agents ---
     feature_builder: bool = True
     # The builder reasons about an unfamiliar API from search results and has to

@@ -16,6 +16,13 @@ schema to have nowhere to put it. `tests/test_builder_tools.py` asserts this aga
 the registered JSON schema, because the thing that would break it is somebody later
 adding a helpful ``secret=`` parameter.
 
+**The builder cannot edit the builder.** Every authoring tool that names an agent
+refuses `BUILDER_SLUG`. That was implicit while the builder could only create — the
+UNIQUE index refuses a second row with that slug — and stopped being implicit the
+moment it could write to an existing one. `app.builder.agent` documents three locks
+on a model rewriting its own instructions; this is the one that would otherwise have
+quietly gone missing.
+
 **Everything the builder creates is inert.** Connections are created ``pending``,
 including peers — overriding the "a tokenless peer is active" default that is right
 when a human typed the URL and wrong when a model found it in a public registry.
@@ -44,7 +51,7 @@ from app.builder.agent import BUILDER_SLUG
 from app.builder.checklist import normalise_steps
 from app.config import Settings, get_settings
 from app.db import ConnectionNameTaken, SlugTaken, Store
-from app.providers import get_provider, providers
+from app.providers import ManifestError, get_provider, providers
 
 logger = logging.getLogger(__name__)
 
@@ -67,10 +74,17 @@ TOOL_NAMES = (
     "bloom_list_providers",
     "bloom_list_connections",
     "bloom_list_agents",
+    "bloom_get_agent",
     "bloom_list_keywords",
+    "bloom_list_manifest_format",
+    "bloom_write_provider_manifest",
     "bloom_create_agent",
+    "bloom_update_agent",
     "bloom_create_connection",
     "bloom_attach_connection",
+    "bloom_detach_connection",
+    "bloom_set_connection_scopes",
+    "bloom_authorize_connection",
     "bloom_set_setup_checklist",
 )
 
@@ -247,24 +261,37 @@ def builder_broker(
     async def _list_providers() -> str:
         found = providers()
         if not found:
-            return "This Bloom ships no provider manifests."
+            return (
+                "This Bloom has no provider manifests at all. Anything you need, you "
+                "will have to write with bloom_write_provider_manifest."
+            )
         lines = []
         for provider in sorted(found.values(), key=lambda p: p.name):
             ops = ", ".join(op.tool_name(provider.name) for op in provider.operations)
+            origin = {
+                "file": "shipped",
+                "stored": "written here",
+                "shared": "from another install",
+            }.get(provider.source, provider.source)
             lines.append(
-                f"- {provider.name} ({provider.display_name}) — auth: "
+                f"- {provider.name} ({provider.display_name}) [{origin}] — auth: "
                 f"{', '.join(provider.auth_methods)}; tools: {ops or '(none)'}"
             )
         return (
-            "Provider manifests this Bloom already ships. If the service is here, use "
-            "it — Bloom cannot call an API it has no manifest for.\n" + "\n".join(lines)
+            "Provider manifests this Bloom can already use. If the service is here, "
+            "use it rather than writing a second definition of the same thing.\n"
+            + "\n".join(lines)
+            + "\n\nA service that is NOT here is not a dead end: if the MCP registry "
+            "has nothing usable either, write a manifest for it with "
+            "bloom_write_provider_manifest."
         )
 
     broker.register(
         "bloom_list_providers",
-        "The provider manifests this Bloom ships, with the tools each contributes. "
-        "A service listed here can be connected; one that is not, cannot — Bloom has "
-        "no way to call an API it has no manifest for.",
+        "The provider manifests this Bloom can use, with the tools each contributes "
+        "and whether it was shipped, written here, or shared by another install. A "
+        "service listed here is already reachable; one that is not can be made "
+        "reachable by writing a manifest.",
         _NO_ARGS,
         _list_providers,
         read_only=True,
@@ -312,6 +339,56 @@ def builder_broker(
         read_only=True,
     )
 
+    async def _get_agent(slug: str) -> str:
+        slug = (slug or "").strip().lower()
+        row = await asyncio.to_thread(store.get_config_by_slug, slug)
+        if row is None:
+            return f"No agent named {slug!r}. Call bloom_list_agents for the real names."
+        if slug == BUILDER_SLUG:
+            return (
+                f"{BUILDER_SLUG!r} is Bloom's own builder — you. Its prompt is defined "
+                "in code and re-seeded at every boot, so it is not readable or "
+                "editable from here."
+            )
+        attached = await asyncio.to_thread(store.connections_for, row["id"])
+        default = "(service default)"
+        lines = [
+            f"slug: {row['slug']}",
+            f"name: {row['name'] or row['slug']}",
+            f"model keyword: {row['model_tier']}",
+            f"max_steps: {row['max_steps'] if row['max_steps'] is not None else default}",
+            f"max_cost_usd: {row['max_cost_usd'] if row['max_cost_usd'] is not None else default}",
+            "",
+            "connections:",
+        ]
+        if not attached:
+            lines.append("  (none — this agent has no external reach)")
+        for c in attached:
+            detail = f"  - {c['name']} — {c['kind']}"
+            if c["provider"]:
+                detail += f"/{c['provider']}"
+            detail += f", status {c['status']}"
+            if c["kind"] == "oauth":
+                detail += f", scopes: {', '.join(c['scopes']) or '(none recorded)'}"
+            lines.append(detail)
+        lines.extend(["", "system prompt:", (row["system_prompt"] or "").strip() or "(empty)"])
+        return "\n".join(lines)
+
+    broker.register(
+        "bloom_get_agent",
+        "One agent in full: its prompt, model keyword, ceilings, and every connection "
+        "with its status and granted scopes. READ THIS BEFORE EDITING ANYTHING. "
+        "bloom_list_agents gives you one line each; an edit made without seeing the "
+        "current prompt overwrites work you never read.",
+        {
+            "type": "object",
+            "properties": {"slug": {"type": "string", "description": "The agent's slug."}},
+            "required": ["slug"],
+        },
+        _get_agent,
+        read_only=True,
+    )
+
     async def _list_keywords() -> str:
         return "Choose from the work, not the name:\n" + "\n".join(
             f"- {k['name']}: {k['description']}" for k in models.keywords(settings)
@@ -325,6 +402,105 @@ def builder_broker(
         _NO_ARGS,
         _list_keywords,
         read_only=True,
+    )
+
+    # --- teaching a Bloom to reach a new service ------------------------------
+    #
+    # The point of these two. A provider used to be a TOML file in the code tree,
+    # so "connect Google Analytics" was a pull request and a redeploy — which does
+    # not scale past the handful of services someone bothered to write by hand, and
+    # is the opposite of the promise that a capability is a row in a table. The
+    # builder now writes the manifest itself, from the service's own documentation.
+    #
+    # `app/manifests.py` documents what that costs and the four things that pay for
+    # it. The one worth repeating here: nothing a manifest declares can act until a
+    # human attaches a credential to a connection using it, and that step now shows
+    # which hosts the credential will be sent to. The gate did not move — it got the
+    # information it was always missing.
+
+    async def _manifest_format() -> str:
+        from app.builder.manifest_format import FORMAT
+
+        return FORMAT
+
+    broker.register(
+        "bloom_list_manifest_format",
+        "The provider manifest format, with a complete worked example and the rules "
+        "that will reject one. Call this BEFORE bloom_write_provider_manifest — the "
+        "format has constraints you cannot infer, and one of them silently produces "
+        "a provider with no scopes rather than an error.",
+        _NO_ARGS,
+        _manifest_format,
+        read_only=True,
+    )
+
+    async def _write_manifest(name: str, toml: str) -> str:
+        from app import manifests
+
+        name = (name or "").strip().lower()
+        if not (toml or "").strip():
+            return (
+                "There is no manifest here. Write the TOML — call "
+                "bloom_list_manifest_format for the shape."
+            )
+        try:
+            provider = await asyncio.to_thread(
+                manifests.save, name=name, toml=toml, run_id=run_id, store=store
+            )
+        except ManifestError as exc:
+            # Prose, so the model fixes it and retries within the same run. This is
+            # the tool most likely to be called twice, and a raise would end the run
+            # on a typo in a TOML table header.
+            return f"That manifest was rejected: {exc}"
+
+        # Published immediately rather than left to the periodic pass: the install
+        # that just did the research is the one with something to share, and the
+        # next box to need this service may be asked for it in the next minute.
+        # Failure is logged inside and ignored — the manifest already works here.
+        from app import manifest_sync
+
+        await manifest_sync.push(provider.name, settings=settings, store=store)
+
+        ops = ", ".join(op.tool_name(provider.name) for op in provider.operations)
+        lines = [
+            f"Stored manifest {provider.name!r} ({provider.display_name}). "
+            f"It is live now — you can create a connection against it in this run.",
+            f"Tools it contributes: {ops or '(none declared)'}"
+            + (f", plus {provider.name}_request" if provider.allow_request else ""),
+            f"A credential for it will be sent to: {', '.join(provider.credential_hosts())}.",
+        ]
+        if not provider.operations and not provider.allow_request:
+            lines.append(
+                "WARNING: no operations and no allow_request, so this provider "
+                "contributes no tools at all and an agent using it can do nothing. "
+                "Add operations, or set allow_request = true."
+            )
+        lines.append(
+            "It is UNVERIFIED until a real request succeeds against it, which cannot "
+            "happen until a human connects an account. Put that on the checklist."
+        )
+        return "\n".join(lines)
+
+    broker.register(
+        "bloom_write_provider_manifest",
+        "Teach this Bloom to reach a service it has no manifest for, by writing one. "
+        "Use it ONLY after bloom_list_providers showed no manifest and the MCP "
+        "registry had nothing usable — this is the third option, not the first. "
+        "Every URL, scope and path in it must come from a page you read with "
+        "read_url, never from memory. Writing the same name again replaces it.",
+        {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": ("snake_case, <=20 chars. Prefixes every tool it contributes."),
+                },
+                "toml": {"type": "string", "description": "The complete manifest, as TOML."},
+            },
+            "required": ["name", "toml"],
+        },
+        _write_manifest,
+        read_only=False,
     )
 
     # --- authoring ------------------------------------------------------------
@@ -553,6 +729,306 @@ def builder_broker(
         read_only=False,
     )
 
+    # --- editing what already exists ------------------------------------------
+    #
+    # The builder could create but never change, which made "give the Spotify agent
+    # permission to skip" unanswerable: the only offer available was to build a
+    # second agent, and a second agent attached to the same connection has the same
+    # scopes as the first. Editing is not a convenience on top of building — it is
+    # the half of the job that was missing.
+    #
+    # Two limits are deliberate and should survive a later edit:
+    #
+    # **The builder cannot edit itself.** `_reject_builder` refuses BUILDER_SLUG on
+    # every write path here, which is the same line `app.admin.agents` holds at the
+    # API and `app.builder.agent` holds by re-seeding the prompt from git on boot.
+    # A model that can rewrite its own instructions is a different product; this is
+    # the third lock on that door, and the one that would otherwise be missing now
+    # that the builder can write to `agent_configs` at all.
+    #
+    # **There is no slug rename.** A slug is how Amber names an agent in `run_task`
+    # and how every past build row refers to it, so renaming it silently breaks
+    # callers that are nowhere near this run. Aperture's PATCH still allows it,
+    # because a human doing it knows what they are renaming.
+
+    def _reject_builder(slug: str) -> str:
+        """The refusal prose, or empty when this slug is not the builder's."""
+        if slug != BUILDER_SLUG:
+            return ""
+        return (
+            f"{BUILDER_SLUG!r} is Bloom's own builder — you. Its instructions live in "
+            "git and are re-seeded at every boot, so editing them here would be "
+            "overwritten at the next restart even if it were allowed. It is not."
+        )
+
+    async def _update_agent(
+        slug: str,
+        name: str = "",
+        system_prompt: str = "",
+        model_keyword: str = "",
+        max_steps: int | None = None,
+        max_cost_usd: float | None = None,
+    ) -> str:
+        slug = (slug or "").strip().lower()
+        refusal = _reject_builder(slug)
+        if refusal:
+            return refusal
+
+        row = await asyncio.to_thread(store.get_config_by_slug, slug)
+        if row is None:
+            return f"No agent named {slug!r}. Call bloom_list_agents for the real names."
+
+        if model_keyword and not models.known(model_keyword):
+            return (
+                f"Unknown model keyword {model_keyword!r}. Call bloom_list_keywords "
+                "and choose one of those."
+            )
+
+        # Empty string means "not supplied" rather than "set it to empty": there is no
+        # legitimate edit that blanks an agent's prompt, and a model that omitted the
+        # argument and one that passed "" are indistinguishable over the wire.
+        patch: dict[str, Any] = {
+            "name": (name or "").strip() or None,
+            "system_prompt": (system_prompt or "").strip() or None,
+            "model_tier": (model_keyword or "").strip() or None,
+            "max_steps": max_steps,
+            "max_cost_usd": max_cost_usd,
+        }
+        changed = [k for k, v in patch.items() if v is not None]
+        if not changed:
+            return (
+                "Nothing to change — every field was empty. Pass the fields you want "
+                "to alter; the ones you omit are left exactly as they are."
+            )
+
+        updated = await asyncio.to_thread(store.update_config, row["id"], **patch)
+        if updated is None:  # pragma: no cover — the row was read a line ago
+            return f"Agent {slug!r} disappeared while being edited."
+
+        readable = {
+            "name": "display name",
+            "system_prompt": "system prompt",
+            "model_tier": "model keyword",
+            "max_steps": "step ceiling",
+            "max_cost_usd": "cost ceiling",
+        }
+        what = ", ".join(readable[k] for k in changed)
+        await _record(agent_config_id=row["id"], agent_slug=row["slug"])
+        await _record_change(f"{slug}: updated {what}")
+        logger.info("Builder updated agent %s (%s)", slug, what)
+        return (
+            f"Updated {slug!r}: {what}. It takes effect on that agent's next run — "
+            "nothing needs restarting."
+        )
+
+    broker.register(
+        "bloom_update_agent",
+        "Change an agent that already exists. Only the fields you pass are touched; "
+        "everything else is left alone. Call bloom_get_agent first and edit the "
+        "prompt you actually read — passing `system_prompt` REPLACES the whole "
+        "prompt, so re-send it in full with your change folded in, never just the "
+        "new sentence. An agent's slug cannot be changed here.",
+        {
+            "type": "object",
+            "properties": {
+                "slug": {"type": "string", "description": "Which agent to change."},
+                "name": {"type": "string", "description": "New display name."},
+                "system_prompt": {
+                    "type": "string",
+                    "description": "The COMPLETE new prompt, not a fragment to append.",
+                },
+                "model_keyword": {"type": "string", "description": "e.g. 'balanced', 'coding'."},
+                "max_steps": {"type": "integer", "description": "New lower ceiling."},
+                "max_cost_usd": {"type": "number", "description": "New lower ceiling."},
+            },
+            "required": ["slug"],
+        },
+        _update_agent,
+        read_only=False,
+    )
+
+    async def _detach_connection(agent_slug: str, connection_name: str) -> str:
+        agent_slug = (agent_slug or "").strip().lower()
+        refusal = _reject_builder(agent_slug)
+        if refusal:
+            return refusal
+
+        agent = await asyncio.to_thread(store.get_config_by_slug, agent_slug)
+        if agent is None:
+            return f"No agent named {agent_slug!r}."
+        row = await asyncio.to_thread(store.get_connection_by_name, (connection_name or "").strip())
+        if row is None:
+            return f"No connection named {connection_name!r}."
+
+        if not await asyncio.to_thread(store.detach_connection, agent["id"], row["id"]):
+            return f"{agent_slug!r} did not have {connection_name!r} attached."
+
+        await _record(agent_config_id=agent["id"], agent_slug=agent["slug"])
+        await _record_change(f"{agent_slug}: detached connection {row['name']}")
+        logger.info("Builder detached %s from %s", row["name"], agent_slug)
+        return (
+            f"Detached {connection_name!r} from {agent_slug!r}. **The connection "
+            "itself survives** in the library with its credential intact, so any "
+            "other agent using it is unaffected and you can re-attach it."
+        )
+
+    broker.register(
+        "bloom_detach_connection",
+        "Unbind one connection from one agent — the connection and its credential "
+        "survive in the library. Use this to swap an agent onto a different "
+        "connection, since Bloom refuses two for the same provider on one agent.",
+        {
+            "type": "object",
+            "properties": {"agent_slug": {"type": "string"}, "connection_name": {"type": "string"}},
+            "required": ["agent_slug", "connection_name"],
+        },
+        _detach_connection,
+        read_only=False,
+    )
+
+    async def _set_connection_scopes(connection_name: str, scopes: list | None = None) -> str:
+        name = (connection_name or "").strip()
+        row = await asyncio.to_thread(store.get_connection_by_name, name)
+        if row is None:
+            return f"No connection named {name!r}. Call bloom_list_connections."
+        if row["kind"] != "oauth":
+            return (
+                f"{name!r} is a {row['kind']} connection. Only OAuth connections have "
+                "scopes — an API key carries whatever permissions it was issued with, "
+                "so widening one means issuing a new key at the provider."
+            )
+
+        wanted = [s.strip() for s in (scopes or []) if isinstance(s, str) and s.strip()]
+        if not wanted:
+            return (
+                "Pass the complete scope list you want this connection to hold. It "
+                "REPLACES the current one, so include the scopes it already has — "
+                "bloom_get_agent shows them."
+            )
+        if sorted(set(wanted)) == sorted(set(row["scopes"])):
+            return (
+                f"{name!r} already holds exactly those scopes. Nothing to change — if "
+                "the agent still cannot do the thing, the limit is elsewhere: check "
+                "the provider's own account tier, or whether the tool exists at all."
+            )
+
+        previous = list(row["scopes"])
+        await asyncio.to_thread(store.update_connection, row["id"], scopes=wanted)
+        added = sorted(set(wanted) - set(previous))
+        note = f"{name}: scopes now {', '.join(wanted)}"
+        if added:
+            note += f" (added {', '.join(added)})"
+        await _record_change(note)
+        logger.info("Builder set scopes on connection %s: %s", name, wanted)
+
+        # Status is deliberately NOT downgraded to pending. The stored token still
+        # works for everything it was already granted, and marking the connection
+        # pending would strip every one of that agent's tools until a human came
+        # back — turning a partly-capable agent into a dead one to signal that it is
+        # about to become more capable.
+        return (
+            f"Recorded {len(wanted)} scope(s) on {name!r}. **The existing token still "
+            "carries the old grant**, so the new permission is not live yet — a "
+            "provider issues scopes at consent time, not on request. The account "
+            "must be re-authorised. Call bloom_authorize_connection for the link, "
+            "and put a 'connect_oauth' step naming this connection on the checklist."
+        )
+
+    broker.register(
+        "bloom_set_connection_scopes",
+        "Set the OAuth scopes a connection should hold. This is how an agent gains a "
+        "permission it was not built with — a scope is a property of the CONNECTION, "
+        "not of the agent, so rebuilding the agent would change nothing. The list "
+        "replaces what is stored, and takes effect only after re-authorisation.",
+        {
+            "type": "object",
+            "properties": {
+                "connection_name": {"type": "string"},
+                "scopes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "The COMPLETE list, including scopes already held. Use the "
+                        "provider's exact strings — read them from its docs, never "
+                        "from memory."
+                    ),
+                },
+            },
+            "required": ["connection_name", "scopes"],
+        },
+        _set_connection_scopes,
+        read_only=False,
+    )
+
+    async def _authorize_connection(connection_name: str) -> str:
+        name = (connection_name or "").strip()
+        if not settings.oauth_enabled:
+            return (
+                "This Bloom cannot run an OAuth flow: BLOOM_FEATURE_OAUTH and "
+                "BLOOM_FERNET_KEYS are not both set. A token stored without a key to "
+                "encrypt it is a breach rather than a degraded mode, so it refuses. "
+                "Put that on the checklist as a 'set_env' step."
+            )
+
+        row = await asyncio.to_thread(store.get_connection_by_name, name)
+        if row is None:
+            return f"No connection named {name!r}."
+        if row["kind"] != "oauth":
+            return f"A {row['kind']} connection has no browser flow to run."
+
+        provider = get_provider(row["provider"] or "")
+        if provider is None or not provider.supports("oauth"):
+            return (
+                f"No OAuth manifest for provider {row['provider']!r} in this Bloom, so "
+                "there is no authorize endpoint to send anyone to."
+            )
+
+        from app.credentials import client_credentials
+        from app.oauth.flow import STATE_TTL_S, OAuthError, start
+
+        secrets_row = await asyncio.to_thread(store.connection_secrets, row["id"])
+        client = client_credentials(secrets_row or {}, settings)
+        try:
+            started = await asyncio.to_thread(
+                start,
+                store,
+                provider,
+                row["id"],
+                scopes=row["scopes"] or None,
+                settings=settings,
+                client=client,
+            )
+        except OAuthError as exc:
+            # The usual cause is a connection with no app registration yet, which is
+            # a checklist item rather than a failure of this run.
+            return f"Cannot start the flow: {exc}"
+
+        await _record_change(f"{name}: authorisation link issued")
+        logger.info("Builder issued an authorize link for connection %s", name)
+        return (
+            f"Authorisation link for {name!r} ({', '.join(started['scopes'])}):\n"
+            f"{started['authorize_url']}\n\n"
+            f"It is valid for {STATE_TTL_S // 60} minutes and grants nothing until the "
+            "person opens it and approves. Nothing about the connection has changed "
+            "yet — an abandoned tab leaves it exactly as it was. Still add the "
+            "'connect_oauth' step to the checklist: the link expires, the step does not."
+        )
+
+    broker.register(
+        "bloom_authorize_connection",
+        "Mint the link a person opens to authorise (or re-authorise) an OAuth "
+        "connection, using the scopes currently recorded on it. Call this AFTER "
+        "bloom_set_connection_scopes, and last — the link is short-lived. You cannot "
+        "open it yourself; hand it back so whoever asked can.",
+        {
+            "type": "object",
+            "properties": {"connection_name": {"type": "string"}},
+            "required": ["connection_name"],
+        },
+        _authorize_connection,
+        read_only=False,
+    )
+
     async def _set_checklist(agent_slug: str, summary: str, steps: list | None = None) -> str:
         clean = normalise_steps(steps)
         if not clean:
@@ -594,6 +1070,7 @@ def builder_broker(
                                     "connect_oauth",
                                     "paste_api_key",
                                     "set_env",
+                                    "review_manifest",
                                     "manual",
                                 ],
                             },
@@ -627,5 +1104,23 @@ def builder_broker(
             )
             return
         await asyncio.to_thread(store.update_build, build["id"], **fields)
+
+    async def _record_change(what: str) -> None:
+        """Append one line to the build's change list.
+
+        This is the *evidence* an edit did something, and `app.builder.service` reads
+        it to decide whether the run succeeded — for the same reason that module
+        settles a build from `agent_config_id` rather than from the model's closing
+        paragraph. An edit cannot be judged by whether an agent exists afterwards,
+        because it existed beforehand too.
+
+        Read-modify-write is safe here because one run's tools are called in
+        sequence; two builder runs never share a build row.
+        """
+        build = await asyncio.to_thread(store.get_build_by_run, run_id)
+        if build is None:
+            logger.warning("Builder run %s has no build row; not recording %r", run_id, what)
+            return
+        await asyncio.to_thread(store.update_build, build["id"], changes=[*build["changes"], what])
 
     return broker

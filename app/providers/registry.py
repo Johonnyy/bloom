@@ -52,15 +52,23 @@ import logging
 import os
 import re
 import tomllib
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from app.urlsafety import host_of, https_public
+
 logger = logging.getLogger(__name__)
 
 MANIFEST_DIR = Path(__file__).resolve().parent
+
+# Bounds on a manifest a *model* wrote. Generous enough never to bite a real
+# provider, small enough that a generation which does not stop cannot fill the
+# database. A file manifest is exempt: it went through review.
+MAX_STORED_OPERATIONS = 20
+MAX_STORED_TOML_BYTES = 16_384
 
 # agent-mcp-py's own rule, applied here even though these tools live in a local
 # broker: 40 leaves room if Bloom ever re-exposes them over MCP, and `__` must
@@ -200,10 +208,41 @@ class Provider:
     auth_style: str = "basic"  # basic | body
     docs_url: str = ""
     revoke_url: str = ""
+    # Where this definition came from: `file` is reviewed code in app/providers,
+    # `stored` was written by the builder on this install, `shared` was pulled from
+    # the sync store. Only `file` has had a human read it, which is exactly what a
+    # person about to paste an API key needs to be told.
+    source: str = "file"
+    # Whether this provider also offers the bounded escape hatch — see
+    # `_make_request_caller`. Off unless the manifest asks for it.
+    allow_request: bool = False
 
     def supports(self, kind: str) -> bool:
         """Whether a connection of this kind can hold a credential for this provider."""
         return kind in self.auth_methods
+
+    @property
+    def reviewed(self) -> bool:
+        """Whether a human has read this definition. False for anything a model wrote."""
+        return self.source == "file"
+
+    def credential_hosts(self) -> tuple[str, ...]:
+        """Every host a credential for this provider would be sent to.
+
+        The trust gate, reduced to the one fact a person can actually judge. A
+        manifest is a long TOML document and nobody reads one before pasting a key;
+        "your key will be sent to api.example.com" is a sentence they can check
+        against the service they think they are connecting.
+
+        Ordered with ``api_base`` first because that is where the credential goes
+        repeatedly and unattended — the OAuth endpoints see it once, at consent.
+        """
+        seen: list[str] = []
+        for url in (self.api_base, self.token_url, self.authorize_url, self.revoke_url):
+            host = host_of(url)
+            if host and host not in seen:
+                seen.append(host)
+        return tuple(seen)
 
     @property
     def env_client_id(self) -> str:
@@ -389,23 +428,91 @@ def _probe(where: str, raw: Any) -> Probe | None:
     return Probe(method=method, path=str(raw.get("path", "/")))
 
 
-def load_manifest(path: Path) -> Provider:
-    """Parse and validate one manifest file."""
+def _check_endpoints(where: str, raw: dict) -> None:
+    """Refuse a stored manifest whose endpoints are unsafe to call with a credential.
+
+    Only applied to ``trusted=False`` manifests — the ones a model wrote. A file in
+    ``app/providers/`` went through code review and may legitimately point at a
+    development host; a row in the database did not, and its ``api_base`` is where
+    `CredentialResolver` will send a live token on every call.
+
+    ``https://169.254.169.254`` is the case that matters. Without this, a manifest
+    naming the cloud metadata endpoint turns the credential resolver into an
+    authenticated client of the instance's own identity service — and it would look
+    like an ordinary provider in every list. `app.urlsafety` documents the residual
+    DNS-rebinding gap this cannot close.
+    """
+    for key in ("api_base", "authorize_url", "token_url", "revoke_url"):
+        url = str(raw.get(key, "") or "")
+        if not url:
+            continue
+        bad = https_public(url)
+        if bad:
+            raise ManifestError(
+                f"{where}: {key} {url!r} {bad}. A stored manifest's endpoints are "
+                "called with your credential attached, so they must be public https."
+            )
+
+
+def _check_stored_bounds(where: str, raw: dict, operations: tuple[Operation, ...]) -> None:
+    """Caps and refusals that apply only to a manifest a model wrote.
+
+    ``DELETE`` is refused outright rather than gated. A manifest authored by a model
+    and then used unattended should not be able to destroy anything, and there is no
+    approval channel that could make it safe — `X-Confirmed` still has no source in
+    this ecosystem. A provider whose useful work is deletion is one to write by hand.
+
+    The count and size caps exist because model output is unbounded by nature: the
+    failure they prevent is not malice but a generation that does not stop.
+    """
+    if len(operations) > MAX_STORED_OPERATIONS:
+        raise ManifestError(
+            f"{where}: {len(operations)} operations, limit {MAX_STORED_OPERATIONS}. "
+            "Write the ones the agent in the brief actually needs, not the whole API."
+        )
+    for op in operations:
+        if op.method == "DELETE":
+            raise ManifestError(
+                f"{where}: operation {op.name!r} is a DELETE, which a stored manifest "
+                "may not declare. Bloom runs these unattended and there is no "
+                "approval step that could make deleting safe."
+            )
+
+
+def load_manifest_text(
+    text: str, *, where: str, trusted: bool = True, source: str = "file"
+) -> Provider:
+    """Parse and validate one manifest, from its TOML text.
+
+    Split out of :func:`load_manifest` so a manifest stored in the database goes
+    through the *same* parser as one shipped as a file — a second implementation for
+    stored manifests is how the two would drift, and the one that drifted would be
+    the one holding model output.
+
+    ``trusted=False`` adds the checks in `_check_endpoints` and `_check_stored_bounds`.
+    Everything the trusted path enforces — the tool-name rule, `FORBIDDEN_PARAMS`,
+    the header ban — still applies to both, and always did; those were written
+    assuming a human author and are now load-bearing against a model one.
+    """
+    if not trusted and len(text.encode("utf-8")) > MAX_STORED_TOML_BYTES:
+        raise ManifestError(
+            f"{where}: {len(text.encode('utf-8'))} bytes, limit {MAX_STORED_TOML_BYTES}."
+        )
     try:
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        raw = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
-        raise ManifestError(f"{path.name}: not valid TOML — {exc}") from exc
+        raise ManifestError(f"{where}: not valid TOML — {exc}") from exc
 
     name = str(raw.get("name", "")).strip()
     if not name or not re.match(r"^[a-z][a-z0-9_]{0,19}$", name):
         raise ManifestError(
-            f"{path.name}: 'name' must be snake_case and at most 20 characters "
+            f"{where}: 'name' must be snake_case and at most 20 characters "
             "(it prefixes every tool this provider contributes)"
         )
     if not raw.get("api_base"):
-        raise ManifestError(f"{path.name}: missing required key 'api_base'")
+        raise ManifestError(f"{where}: missing required key 'api_base'")
 
-    auth_methods = _auth_methods(path.name, raw.get("auth"))
+    auth_methods = _auth_methods(where, raw.get("auth"))
     # Required *because of* what this provider declares it supports, rather than
     # unconditionally: an api_key-only provider has no authorize endpoint and no
     # client credentials to name, and demanding them would mean inventing values.
@@ -413,7 +520,7 @@ def load_manifest(path: Path) -> Provider:
         for required in ("authorize_url", "token_url"):
             if not raw.get(required):
                 raise ManifestError(
-                    f"{path.name}: missing required key {required!r} (this provider's "
+                    f"{where}: missing required key {required!r} (this provider's "
                     "'auth' includes oauth)"
                 )
 
@@ -424,10 +531,12 @@ def load_manifest(path: Path) -> Provider:
             raise ManifestError(f"{name}: duplicate operation {op.name!r}")
         seen.add(op.name)
 
+    if not trusted:
+        _check_endpoints(where, raw)
+        _check_stored_bounds(where, raw, operations)
+
     api_key = (
-        _api_key_spec(path.name, raw.get("api_key"), operations)
-        if "api_key" in auth_methods
-        else None
+        _api_key_spec(where, raw.get("api_key"), operations) if "api_key" in auth_methods else None
     )
 
     return Provider(
@@ -440,7 +549,7 @@ def load_manifest(path: Path) -> Provider:
         client_secret_env=str(raw.get("client_secret_env", "")),
         auth_methods=auth_methods,
         api_key=api_key,
-        probe=_probe(path.name, raw.get("probe")),
+        probe=_probe(where, raw.get("probe")),
         scopes_default=tuple(str(s) for s in raw.get("scopes_default", ()) or ()),
         operations=operations,
         pkce=bool(raw.get("pkce", True)),
@@ -448,12 +557,18 @@ def load_manifest(path: Path) -> Provider:
         auth_style=str(raw.get("auth_style", "basic")),
         docs_url=str(raw.get("docs_url", "")),
         revoke_url=str(raw.get("revoke_url", "")),
+        source=source,
+        allow_request=bool(raw.get("allow_request", False)),
     )
 
 
-@lru_cache
-def providers() -> dict[str, Provider]:
-    """Every manifest in ``app/providers``, by name.
+def load_manifest(path: Path) -> Provider:
+    """Parse and validate one manifest file."""
+    return load_manifest_text(path.read_text(encoding="utf-8"), where=path.name, trusted=True)
+
+
+def file_providers() -> dict[str, Provider]:
+    """Every manifest shipped as a file in ``app/providers``, by name.
 
     A malformed manifest is fatal for that provider only — it is logged and
     skipped, so one bad file cannot stop the service from starting and taking
@@ -467,8 +582,55 @@ def providers() -> dict[str, Provider]:
             logger.exception("Ignoring provider manifest %s", path.name)
             continue
         found[provider.name] = provider
+    return found
+
+
+#: Set by `app.manifests.install_loader` at import of the store layer. A function
+#: rather than a direct import because `app.providers` must not depend on `app.db` —
+#: the manifest loader is used by tests and tools that never open a database, and a
+#: hard dependency would make a provider definition require one.
+_stored_loader: Callable[[], dict[str, Provider]] | None = None
+
+
+def set_stored_loader(loader: Callable[[], dict[str, Provider]] | None) -> None:
+    """Install (or remove) the source of database-stored manifests, and invalidate."""
+    global _stored_loader
+    _stored_loader = loader
+    reload_providers()
+
+
+@lru_cache
+def providers() -> dict[str, Provider]:
+    """Every provider this Bloom can reach: shipped files unioned with stored rows.
+
+    **A file always wins.** `spotify.toml` and `github.toml` are reviewed code and
+    are the reference implementations; a stored row that claimed one of those names
+    would silently redefine where a credential goes. The write path refuses the name
+    outright, and this is the second half of that guarantee — belt and braces,
+    because the two are enforced in different modules and only one of them is
+    reached by a manifest arriving from the sync store.
+
+    Still cached, but no longer for the lifetime of the process: `reload_providers`
+    is called whenever a stored manifest is written, so a manifest the builder wrote
+    is live inside the same run rather than after a restart.
+    """
+    found: dict[str, Provider] = {}
+    if _stored_loader is not None:
+        try:
+            found.update(_stored_loader())
+        except Exception:  # noqa: BLE001 — a bad row must not take the service down
+            logger.exception("Could not load stored provider manifests")
+    for name, provider in file_providers().items():
+        if name in found:
+            logger.warning("Stored manifest %r shadowed by the shipped file; file wins", name)
+        found[name] = provider
     logger.info("Loaded %d provider manifest(s): %s", len(found), ", ".join(sorted(found)) or "-")
     return found
+
+
+def reload_providers() -> None:
+    """Drop the provider cache so the next read sees a manifest just written."""
+    providers.cache_clear()
 
 
 def get_provider(name: str) -> Provider | None:
@@ -579,7 +741,65 @@ def register_operations(
             requires_confirmation=op.requires_confirmation,
         )
         count += 1
+
+    if provider.allow_request:
+        broker.register(
+            f"{provider.name}_request",
+            f"Make a request to the {provider.display_name} API that no named tool "
+            f"here covers. Read the endpoint from {provider.docs_url or 'the API docs'} "
+            "first — never guess a path. Prefer a named tool when one fits: this is "
+            "the fallback, and it gives you a raw response to interpret rather than "
+            "a result. DELETE is not available.",
+            REQUEST_SCHEMA,
+            _make_request_caller(provider, connection_id, resolver, http_client_factory),
+            # Not read-only: the method is the model's to choose, and it may write.
+            read_only=False,
+        )
+        count += 1
     return count
+
+
+#: Methods the escape hatch may use. DELETE is absent for the same reason a stored
+#: manifest may not declare one: this runs unattended with no approval channel.
+REQUEST_METHODS = ("GET", "POST", "PUT", "PATCH")
+
+REQUEST_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "path": {
+            "type": "string",
+            "description": (
+                "Path below the API base, starting with '/'. Not a full URL — the "
+                "host is fixed and cannot be changed."
+            ),
+        },
+        "method": {"type": "string", "enum": list(REQUEST_METHODS), "description": "Default GET."},
+        "query": {"type": "object", "description": "Query string parameters."},
+        "body": {"type": "object", "description": "JSON body, for POST/PUT/PATCH."},
+    },
+    "required": ["path"],
+}
+
+
+def safe_path(path: str) -> str:
+    """The reason this path may not be requested, or empty if it may.
+
+    The escape hatch is only bounded if the host is: a `path` of
+    ``https://evil.example/x`` or ``//evil.example/x`` concatenated onto
+    ``api_base`` would send the user's credential somewhere else entirely, and
+    ``/../..`` would climb out of the API's own namespace. This is the check that
+    makes "locked to `api_base`" a fact rather than a description.
+    """
+    path = (path or "").strip()
+    if not path.startswith("/"):
+        return "must start with '/'"
+    if path.startswith("//"):
+        return "must not start with '//' — that is a different host"
+    if "://" in path:
+        return "must be a path, not a full URL"
+    if ".." in path:
+        return "must not contain '..'"
+    return ""
 
 
 def _make_caller(
@@ -645,6 +865,86 @@ def _make_caller(
                     "Ask the user to reconnect it in Aperture."
                 )
 
+        return _summarise(response.status_code, _text_of(response))
+
+    return call
+
+
+def _make_request_caller(
+    provider: Provider,
+    connection_id: str,
+    resolver: Any,
+    http_client_factory: Any,
+):
+    """Build the bounded escape hatch: one request the manifest did not name.
+
+    This is what a generic ``provider_request`` tool was rejected for being, and it
+    is here anyway — because the thing it was rejected *in favour of* was a
+    hand-written manifest, and a manifest is now written by a model too. The choice
+    is no longer "declared operations or guessing", it is "guessing at authoring
+    time, frozen" versus "guessing at call time, correctable". Declared operations
+    are still better and still preferred; this exists so that a service whose API
+    the builder could not model cleanly produces a working agent instead of a failed
+    build.
+
+    Three bounds make it materially safer than the tool that was rejected:
+
+    * **the host is fixed.** `safe_path` refuses anything that could leave
+      ``api_base`` — a full URL, a protocol-relative path, a traversal;
+    * **DELETE does not exist**, matching the rule for a stored manifest's declared
+      operations;
+    * **it is opt-in per provider** (``allow_request``), so a manifest with good
+      operations does not also carry it.
+
+    It is deliberately not read-only, and the response is returned raw: a model
+    calling this is interpreting an API it was not given a schema for, and dressing
+    that up as a clean result would hide exactly the uncertainty worth keeping.
+    """
+
+    async def call(
+        path: str = "", method: str = "GET", query: dict | None = None, body: dict | None = None
+    ) -> str:
+        bad = safe_path(path)
+        if bad:
+            return f"Refusing that path: it {bad}."
+        method = (method or "GET").strip().upper()
+        if method not in REQUEST_METHODS:
+            return f"method must be one of {', '.join(REQUEST_METHODS)}."
+
+        cred = await resolver.credential(connection_id)
+        if not cred:
+            return (
+                f"{provider.display_name} is not connected, or its authorisation has "
+                "expired. Ask the user to reconnect it in Aperture."
+            )
+
+        import httpx2
+
+        factory = http_client_factory or httpx2.AsyncClient
+        url = provider.api_base + path.strip()
+
+        async def send(credential):
+            async with factory() as client:
+                return await client.request(
+                    method,
+                    url,
+                    params={**(query or {}), **credential.params} or None,
+                    json=body or None,
+                    headers=credential.headers,
+                    timeout=30.0,
+                )
+
+        response = await send(cred)
+        if response.status_code == 401 and cred.refreshable:
+            cred = await resolver.credential(connection_id, force_refresh=True)
+            if cred:
+                response = await send(cred)
+        if response.status_code == 401:
+            await resolver.mark_needs_reauth(connection_id)
+            return (
+                f"{provider.display_name} rejected the stored credential. "
+                "Ask the user to reconnect it in Aperture."
+            )
         return _summarise(response.status_code, _text_of(response))
 
     return call

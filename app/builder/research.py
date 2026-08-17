@@ -20,31 +20,31 @@ the route answers 503 — refusing rather than guessing.
 **`read_url` is the genuinely new attack surface**, exactly as it is in Amber, and
 for the same reason: Bloom runs on a VPS beside other services, so a tool that
 fetches an arbitrary URL on request is a tool that can be talked into fetching
-``http://169.254.169.254/`` or a neighbour's admin port. `_check_url` refuses
+``http://169.254.169.254/`` or a neighbour's admin port. `check_url` refuses
 non-HTTP schemes and any host resolving into a loopback, private, link-local or
 otherwise reserved range — and it refuses **before** an HTTP client is constructed,
 so a blocked request makes no network call at all. That ordering is the property
 worth testing, and `tests/test_research_tools.py` asserts the client factory was
 never called rather than matching on the message.
 
-The residual gap is DNS rebinding: a hostname that passes the check and resolves to
-something else on the connection itself. Closing it properly means pinning the
-resolved address through the socket, which the client does not expose cleanly. It is
-documented rather than papered over — the realistic attack, a model persuaded to
-fetch a literal metadata IP or an internal hostname, is closed.
+Those checks now live in `app.urlsafety`, re-exported here so this module's callers
+and its tests are unchanged. They moved because `app.providers.registry` applies the
+same rules to a stored manifest's endpoints, and a provider definition importing the
+agent that writes one is the wrong direction — see that module for the threat, which
+is strictly worse there: a manifest's ``api_base`` is called *with a credential
+attached*, so a bad one turns the metadata service into an authenticated client of
+itself. The residual DNS-rebinding gap is documented there too.
 """
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import logging
-import socket
 from typing import Any
-from urllib.parse import urlparse
 
 from app.builder.htmltext import extract
 from app.config import Settings, get_settings
+from app.urlsafety import check_url, https_public
 
 logger = logging.getLogger(__name__)
 
@@ -53,67 +53,9 @@ TAVILY_URL = "https://api.tavily.com/search"
 _READABLE_TYPES = ("text/html", "application/xhtml", "text/plain", "application/json")
 _USER_AGENT = "Mozilla/5.0 (compatible; Bloom/0.1; agent builder)"
 
-# Hostnames that never route anywhere legitimate from Bloom's perspective.
-_BLOCKED_NAMES = ("localhost", "localhost.localdomain")
-_BLOCKED_SUFFIXES = (".local", ".internal", ".localhost")
-
-
-def _blocked_address(host: str) -> bool:
-    """True if ``host`` is (or resolves to) an address Bloom must not reach."""
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except socket.gaierror:
-        # Unresolvable: let the request fail normally rather than claiming it is
-        # dangerous. Nothing is reachable, so nothing is at risk.
-        return False
-
-    for info in infos:
-        try:
-            addr = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            continue
-        if (
-            addr.is_private
-            or addr.is_loopback
-            or addr.is_link_local
-            or addr.is_reserved
-            or addr.is_multicast
-            or addr.is_unspecified
-        ):
-            return True
-    return False
-
-
-def check_url(url: str) -> str | None:
-    """The reason this URL cannot be fetched, or ``None`` if it is allowed."""
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return "Error: that is not a valid web address."
-
-    if parsed.scheme not in ("http", "https"):
-        return "Error: only http and https pages can be read."
-    host = (parsed.hostname or "").lower()
-    if not host:
-        return "Error: that is not a valid web address."
-    if host in _BLOCKED_NAMES or host.endswith(_BLOCKED_SUFFIXES):
-        return "Error: pages on the local network cannot be read."
-    if _blocked_address(host):
-        return "Error: pages on the local network cannot be read."
-    return None
-
-
-def https_public(url: str) -> str | None:
-    """The reason this URL is unsafe as a stored API base, or ``None``.
-
-    Stricter than :func:`check_url` by one rule — HTTPS is required, not merely
-    preferred — because this is applied to a URL that will be stored and then called
-    repeatedly *with a credential attached*, rather than read once.
-    """
-    parsed = urlparse(url or "")
-    if parsed.scheme != "https":
-        return "must be https"
-    return "resolves to a private or loopback address" if check_url(url) else None
+#: Re-exported so `research.check_url` / `research.https_public` keep working for
+#: every caller and test written before these moved to `app.urlsafety`.
+__all__ = ["check_url", "https_public", "read_url", "web_search"]
 
 
 async def web_search(

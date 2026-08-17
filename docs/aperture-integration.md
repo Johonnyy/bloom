@@ -25,8 +25,9 @@ protocol registration ever fails.
 ## The builder
 
 ```
-POST   /admin/builder/build            {brief}  202 → {build_id, run_id, stream_url, trace_url}
-GET    /admin/builds                   ?limit&offset&status → Build[]
+POST   /admin/builder/build            {brief}  202 → {build_id, run_id, mode, stream_url, trace_url}
+POST   /admin/builder/edit  {agent_slug, change} 202 → same shape, mode='edit'
+GET    /admin/builds                   ?limit&offset&status&mode → Build[]
 GET    /admin/builds/{build_id}                  200 → Build
 POST   /admin/builds/{build_id}/steps/{index}/done  200 → Build
 DELETE /admin/builds/{build_id}                  204
@@ -37,6 +38,22 @@ GET    /admin/models/keywords                    200 → {keywords[], shared, de
 existing `/admin/runs/{id}/events` stream and the existing trace renderer, so the
 builder needed no new transport in Aperture at all. `POST` answers 202 immediately;
 read the outcome from `/admin/builds/{id}` once the run's terminal event arrives.
+
+**An edit is a build with `mode='edit'`** — same row, same stream, same trace, same
+checklist, so it reuses the build panel rather than needing a second one. Put it on
+the agent detail page as "change this agent" taking a sentence; `?mode=edit` filtered
+to that slug is the agent's change history. Two differences worth rendering:
+
+* **`changes[]` is what actually happened**, one line per write. It is empty for a
+  build, whose evidence is the agent it left behind, and an edit with an empty
+  `changes` is always `failed` — show that list, not the summary, when answering
+  "did it work".
+* **`needs_setup` after an edit usually means re-consent.** Widening an OAuth scope
+  records the scope but cannot grant it; the stored token keeps the grant it was
+  issued with until someone approves the new one. The connection stays `active`
+  throughout — deliberately, so the agent keeps the tools it already had — so the
+  outstanding `connect_oauth` step is the only signal, and a UI that reports
+  "updated" without surfacing it tells the user a permission is live when it is not.
 
 `Build.status` is `running | needs_setup | ready | failed`. **`failed` is sometimes
 the correct answer** — no usable MCP server and no shipped manifest means the builder
@@ -49,13 +66,58 @@ it: `connect_oauth` → the Connect button, `paste_api_key` → the secret box,
 Aperture's `toSetupStep` do exactly this, so the two ends cannot disagree about what
 a stored checklist means.
 
-`503 unavailable` from `/builder/build` means the builder is not configured, and the
-message names which of `BLOOM_FEATURE_BUILDER`, `BLOOM_OPENROUTER_API_KEY` or
-`BLOOM_SEARCH_API_KEY` is missing. Show it as a setup prompt, not an error.
+`503 unavailable` from `/builder/build` or `/builder/edit` means the builder is not
+configured, and the message names which of `BLOOM_FEATURE_BUILDER`,
+`BLOOM_OPENROUTER_API_KEY` or `BLOOM_SEARCH_API_KEY` is missing. Show it as a setup
+prompt, not an error. `404 not_found` from `/builder/edit` is an unknown slug,
+resolved before anything is spent.
 
 `AgentConfig.builtin` marks Bloom's own builder row. Its slug and prompt are defined
 in code and re-seeded at every boot, so Bloom answers `409` to an edit of either —
-show them read-only. The model keyword and the ceilings are editable.
+show them read-only, and do not offer "change this agent" on it at all: the builder
+refuses to edit itself, at the route and again at each tool. The model keyword and
+the ceilings are editable.
+
+## Provider manifests
+
+```
+GET    /admin/manifests                  200 → Manifest[]
+GET    /admin/manifests/{name}           200 → Manifest
+PUT    /admin/manifests/{name}   {toml}  200 → Manifest   (422 with the parser's message)
+DELETE /admin/manifests/{name}           204
+```
+
+**A provider is no longer necessarily code.** The builder writes manifests at runtime
+from a service's own documentation, because shipping a TOML file per OAuth service
+does not scale. `source` says which kind each one is: `file` (shipped, reviewed,
+read-only), `stored` (written on this install), `shared` (pulled from the sync store).
+`editable` is the flag to render from — it is false exactly for shipped files, which
+should read as read-only rather than 404.
+
+**`PUT` is the feature, not a CRUD nicety.** A model-authored operation will sometimes
+have the wrong path or a scope string that does not exist, and the whole point of
+writing manifests at runtime is lost if fixing one means editing a repository. Give it
+a real editor: `toml` is the source of truth, `operations[]` is a flattened projection
+for display. A `422` carries the parser's own message, which names what to change.
+`DELETE` leaves connections and their credentials alone, so "delete it and let the
+builder try again" is a safe recovery to offer.
+
+**Two fields carry the trust story, and they belong next to the credential form** —
+they are on `Connection`, not buried in a settings page:
+
+| Field | Render as |
+|---|---|
+| `provider_reviewed` | false → "this definition was written by Bloom, not reviewed by a person" |
+| `credential_hosts` | "your key will be sent to **api.example.com**" — the first entry is the API base, where it goes repeatedly and unattended |
+| `verified_at` (on `Manifest`) | null → "unproven". Set by a successful `POST /connections/{id}/test`, which is the only evidence a manifest describes a real API |
+
+A person cannot audit a 90-line TOML document before pasting a key. They *can* check
+a hostname against the service they meant to connect, which is why that is the fact
+surfaced. Show it at the moment the credential is entered — a warning anywhere else
+is a warning nobody sees.
+
+The `review_manifest` checklist step points here: `connection_name` carries the
+provider name. It is not a gate and nothing blocks on it.
 
 ## Connection basics
 

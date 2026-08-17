@@ -30,6 +30,11 @@ from typing import Any
 #: * ``connect_oauth`` — press Connect and complete the browser flow
 #: * ``paste_api_key`` — paste a static key for an api_key connection
 #: * ``set_env`` — set an environment variable on the server and restart
+#: * ``review_manifest`` — read a provider definition the builder wrote, before
+#:   giving it a credential. Renders as the manifest view with its
+#:   ``credential_hosts`` shown; ``connection_name`` carries the provider name.
+#:   Not a gate — nothing blocks on it — but it is where a wrong ``api_base`` is
+#:   catchable by the one person who knows which service they meant to connect.
 #: * ``manual`` — anything else, rendered as text
 STEP_KINDS = (
     "register_oauth_app",
@@ -37,6 +42,7 @@ STEP_KINDS = (
     "connect_oauth",
     "paste_api_key",
     "set_env",
+    "review_manifest",
     "manual",
 )
 

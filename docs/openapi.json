@@ -280,6 +280,14 @@
             "title": "Brief",
             "type": "string"
           },
+          "changes": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Changes",
+            "type": "array"
+          },
           "checklist": {
             "items": {
               "$ref": "#/components/schemas/SetupStep"
@@ -311,6 +319,11 @@
           },
           "id": {
             "title": "Id",
+            "type": "string"
+          },
+          "mode": {
+            "default": "build",
+            "title": "Mode",
             "type": "string"
           },
           "run_id": {
@@ -351,6 +364,11 @@
         "properties": {
           "build_id": {
             "title": "Build Id",
+            "type": "string"
+          },
+          "mode": {
+            "default": "build",
+            "title": "Mode",
             "type": "string"
           },
           "run_id": {
@@ -498,6 +516,13 @@
             "title": "Created At",
             "type": "string"
           },
+          "credential_hosts": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Credential Hosts",
+            "type": "array"
+          },
           "expires_at": {
             "anyOf": [
               {
@@ -554,6 +579,16 @@
               }
             ],
             "title": "Provider"
+          },
+          "provider_reviewed": {
+            "default": true,
+            "title": "Provider Reviewed",
+            "type": "boolean"
+          },
+          "provider_source": {
+            "default": "file",
+            "title": "Provider Source",
+            "type": "string"
           },
           "scopes": {
             "items": {
@@ -655,6 +690,30 @@
         "title": "ConnectionPatch",
         "type": "object"
       },
+      "EditIn": {
+        "additionalProperties": false,
+        "description": "A change to an agent that already exists.\n\nSeparate from :class:`BuildIn` rather than a ``mode`` field on it, because the\ntwo carry different information: an edit must name its target, and a build must\nnot. A single model would make ``agent_slug`` optional and push the \"required\nwhen mode is edit\" rule into a validator nobody reads.",
+        "properties": {
+          "agent_slug": {
+            "description": "The agent to change, e.g. 'spotify-dj'.",
+            "title": "Agent Slug",
+            "type": "string"
+          },
+          "change": {
+            "description": "Plain language: 'let it skip tracks', 'stop it answering questions about billing'.",
+            "maxLength": 4000,
+            "minLength": 3,
+            "title": "Change",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_slug",
+          "change"
+        ],
+        "title": "EditIn",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -725,6 +784,192 @@
           "default"
         ],
         "title": "KeywordsOut",
+        "type": "object"
+      },
+      "ManifestIn": {
+        "additionalProperties": false,
+        "properties": {
+          "toml": {
+            "description": "The complete manifest. Replaces what is stored; never merged.",
+            "maxLength": 64000,
+            "minLength": 10,
+            "title": "Toml",
+            "type": "string"
+          }
+        },
+        "required": [
+          "toml"
+        ],
+        "title": "ManifestIn",
+        "type": "object"
+      },
+      "ManifestOut": {
+        "properties": {
+          "allow_request": {
+            "title": "Allow Request",
+            "type": "boolean"
+          },
+          "api_base": {
+            "title": "Api Base",
+            "type": "string"
+          },
+          "auth_methods": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Auth Methods",
+            "type": "array"
+          },
+          "created_at": {
+            "default": "",
+            "title": "Created At",
+            "type": "string"
+          },
+          "credential_hosts": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Credential Hosts",
+            "type": "array"
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "docs_url": {
+            "default": "",
+            "title": "Docs Url",
+            "type": "string"
+          },
+          "editable": {
+            "title": "Editable",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "operations": {
+            "items": {
+              "$ref": "#/components/schemas/OperationOut"
+            },
+            "title": "Operations",
+            "type": "array"
+          },
+          "reviewed": {
+            "title": "Reviewed",
+            "type": "boolean"
+          },
+          "run_id": {
+            "default": "",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "scopes_default": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Scopes Default",
+            "type": "array"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "toml": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Toml"
+          },
+          "updated_at": {
+            "default": "",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "verified_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Verified At"
+          },
+          "verified_note": {
+            "default": "",
+            "title": "Verified Note",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "display_name",
+          "source",
+          "editable",
+          "reviewed",
+          "credential_hosts",
+          "auth_methods",
+          "api_base",
+          "scopes_default",
+          "allow_request",
+          "operations"
+        ],
+        "title": "ManifestOut",
+        "type": "object"
+      },
+      "OperationOut": {
+        "description": "One operation, flattened for display. The TOML remains the source of truth.",
+        "properties": {
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "method": {
+            "title": "Method",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "read_only": {
+            "title": "Read Only",
+            "type": "boolean"
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Scopes",
+            "type": "array"
+          },
+          "tool_name": {
+            "title": "Tool Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "tool_name",
+          "method",
+          "path",
+          "description",
+          "read_only",
+          "scopes"
+        ],
+        "title": "OperationOut",
         "type": "object"
       },
       "ProbeOut": {
@@ -1793,9 +2038,69 @@
         ]
       }
     },
+    "/admin/builder/edit": {
+      "post": {
+        "description": "Change an agent that already exists, using the same builder and the same trace.\n\nShaped exactly like ``/builder/build`` \u2014 202 and a stream URL \u2014 so Aperture\nreuses the build panel it already has rather than growing a second one.\n\nThe slug is resolved *here*, synchronously, so an unknown agent is a 404 before\nanything is spent. Everything after that point costs a builder run.",
+        "operationId": "edit_admin_builder_edit_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EditIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildStarted"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Edit",
+        "tags": [
+          "builder"
+        ]
+      }
+    },
     "/admin/builds": {
       "get": {
-        "description": "Builds, newest first. Filter by status to find what still needs a credential.",
+        "description": "Builds, newest first. Filter by status to find what still needs a credential.\n\n``mode='edit'`` is an agent's change history \u2014 what has been altered since it was\nbuilt, and by which run.",
         "operationId": "list_builds_admin_builds_get",
         "parameters": [
           {
@@ -1837,6 +2142,24 @@
               ],
               "description": "running | needs_setup | ready | failed",
               "title": "Status"
+            }
+          },
+          {
+            "description": "build | edit",
+            "in": "query",
+            "name": "mode",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "build | edit",
+              "title": "Mode"
             }
           },
           {
@@ -2786,6 +3109,235 @@
         "summary": "Test Connection",
         "tags": [
           "connections"
+        ]
+      }
+    },
+    "/admin/manifests": {
+      "get": {
+        "description": "Every provider this Bloom can reach, shipped and stored alike.\n\nOne list rather than two, because \"which services can I connect\" is the question\nbeing asked and where a definition came from is an attribute of the answer, not\na reason to split it. `source` and `editable` carry that distinction.",
+        "operationId": "list_manifests_admin_manifests_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ManifestOut"
+                  },
+                  "title": "Response List Manifests Admin Manifests Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Manifests",
+        "tags": [
+          "manifests"
+        ]
+      }
+    },
+    "/admin/manifests/{name}": {
+      "delete": {
+        "description": "Forget a stored manifest. **Connections using it survive, with their credentials.**\n\nThe same posture as deleting an agent leaving its connections alone: deleting a\ndefinition is not deleting the account someone connected through it. Their tools\nstop being registered until a manifest for the name exists again, which makes\nthis a safe way to let the builder retry rather than a destructive one.",
+        "operationId": "delete_manifest_admin_manifests__name__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Manifest",
+        "tags": [
+          "manifests"
+        ]
+      },
+      "get": {
+        "operationId": "get_manifest_admin_manifests__name__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManifestOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Manifest",
+        "tags": [
+          "manifests"
+        ]
+      },
+      "put": {
+        "description": "Create or correct a stored manifest.\n\nThe route that means a wrong operation is fixed in Aperture rather than in the\nrepository. Validation is `app.manifests.save`'s \u2014 the same one the builder's\ntool goes through \u2014 so a 422 here means the manifest would have been refused\nfrom either direction, and its message names what to change.",
+        "operationId": "put_manifest_admin_manifests__name__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ManifestIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManifestOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Manifest",
+        "tags": [
+          "manifests"
         ]
       }
     },

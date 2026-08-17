@@ -25,7 +25,7 @@ It is the service the ecosystem docs have been calling `agent-spawner`.
 
 | | | |
 |---|---|---|
-| `/mcp` | **Execution.** `run_task` to delegate, `build_agent` to create. | How *other agents* reach it. MCP, because a model has to discover and choose. |
+| `/mcp` | **Execution.** `run_task` to delegate, `build_agent` to create, `edit_agent` to change one. | How *other agents* reach it. MCP, because a model has to discover and choose. |
 | `/admin/*` | **Management.** CRUD over configs, connections, test runs, run history, builds. | How *Aperture* edits them. Plain REST, because a GUI wants an OpenAPI schema and a generated client, not tool selection. |
 
 Both are bearer-authenticated, with **deliberately separate key sets**
@@ -76,11 +76,11 @@ curl -H "Authorization: Bearer $KEY" localhost:8010/admin/agents
 
 ## What is built
 
-All of it, with 259 tests and no network needed to run them.
+All of it, with 342 tests and no network needed to run them.
 
 - [x] Agent config CRUD (`/admin/agents`), the store, the error envelope, auth
-- [x] `/mcp` — `run_task`, `build_agent`, `list_agents`, `bloom://agents`,
-      `bloom://builds`
+- [x] `/mcp` — `run_task`, `build_agent`, `edit_agent`, `list_agents`,
+      `bloom://agents`, `bloom://builds`
 - [x] Execution: `runtime_service.build_runner`, ceilings, broker teardown
 - [x] Run trace: `run_events`, live SSE with `Last-Event-ID` resumption, test-run
 - [x] Connections: one library, three kinds (`oauth` / `api_key` / `mcp`), shared
@@ -90,6 +90,17 @@ All of it, with 259 tests and no network needed to run them.
 - [x] The builder (`app/builder/`) — MCP-registry-first research, Tavily search and
       a URL reader, agent and connection authoring, and a typed setup checklist.
       Privileged tools reach exactly one reserved slug and nothing else
+- [x] **Provider manifests written at runtime.** Shipping a TOML file per OAuth
+      service does not scale, so the builder writes them from the service's own
+      docs and they live in the database, not the code tree. Shared through the
+      sync store so one install's research is not repeated. A shipped file always
+      wins, endpoints must be public https, no DELETE, and a wrong one is fixed at
+      `PUT /admin/manifests/{name}` rather than in an editor
+- [x] Editing what it built — `POST /admin/builder/edit` and the `edit_agent` tool,
+      covering prompts, keywords, ceilings, attachments and OAuth scopes. A scope
+      belongs to the connection, so "let it skip tracks" is an edit, not a rebuild —
+      a rebuilt agent would inherit the same grant. The builder still cannot edit
+      itself
 - [x] Model keywords (`app/models.py`) — the ecosystem's ten, pulled from the shared
       sync store, so `coding` means the same thing here as it does to Amber
 - [x] [docs/aperture-integration.md](docs/aperture-integration.md) + `docs/openapi.json`
@@ -100,7 +111,24 @@ a `bloom/docker-compose.prod.yml`, an `apps.bloom` stanza in `secrets.yaml`, and
 
 ## Adding a provider
 
-A file, not code. Copy [app/providers/spotify.toml](app/providers/spotify.toml) (an
+**Usually you don't — you ask.** Tell the builder to make an agent for a service and
+it writes the provider manifest itself, from that service's own documentation, and
+stores it in the database. Shipping a TOML file per OAuth service was the last thing
+here that made adding a capability a pull request and a redeploy, which is exactly
+what Bloom exists to stop. If it gets an operation wrong, fix it at
+`PUT /admin/manifests/{name}` — a form in Aperture, not an editor and a deploy.
+
+The rules a written manifest must pass, on top of everything below: endpoints must be
+public HTTPS (a manifest naming `169.254.169.254` would aim your live credential at
+the cloud metadata service), no `DELETE` operations, at most 20 operations and 16 KB.
+A shipped file always beats a stored row, so `spotify` and `github` cannot be
+redefined. Manifests are shared through the sync store, so one install's research is
+not repeated on the next. See
+[docs/provider-manifests-future.md](docs/provider-manifests-future.md) for what the
+trade costs and what pays for it.
+
+**Writing one by hand** is still a file, not code, and is how the two shipped
+examples work. Copy [app/providers/spotify.toml](app/providers/spotify.toml) (an
 OAuth provider) or [app/providers/github.toml](app/providers/github.toml) (which
 also accepts a pasted key), say which kinds of credential it takes with `auth`, and
 declare one `[[operations]]` block per thing an agent should be able to do. Each becomes a tool

@@ -69,6 +69,13 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "C4"]
 
+[tool.ruff.lint.per-file-ignores]
+# This file is one long string: the manifest format reference, read by the model
+# that has to write a manifest. Its TOML example uses inline tables, where the line
+# break is not free — wrapping one changes the document being taught. Prose is
+# hand-wrapped to fit; the example is not.
+"app/builder/manifest_format.py" = ["E501"]
+
 [tool.ruff.lint.flake8-bugbear]
 # `def handler(x = Depends(...))` is how FastAPI declares dependencies — the
 # call in the default is the entire mechanism, not the mutable-default bug B008

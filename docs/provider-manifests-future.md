@@ -1,107 +1,145 @@
 # Reaching a service Bloom has no manifest for
 
-What the builder does today when it finds neither an MCP server nor a shipped
-provider manifest, the options that were considered instead, and what each would
-cost. Written down because the decision is easy to re-litigate badly: "just let it
-write the file" sounds obviously right until you notice what the file *is*.
+**Status: built.** This document used to lay out three options and pick none of
+them; Option A shipped, hardened, with the storage question resolved differently
+from the sketch. What follows is what exists, why it was chosen over the safer
+alternatives, and what is still open. The security reasoning that argued *against*
+this is preserved in "What it costs", because none of it stopped being true — it
+was priced, not refuted.
 
 ## What happens today
 
-The builder's fallback order is:
+The builder's fallback order:
 
 1. a usable MCP server from the official registry — usable meaning a
    `streamable-http` remote needing no header but `Authorization: Bearer`, which is
    all `agent_runtime.MCPClient` can speak;
-2. a provider manifest Bloom already ships (`app/providers/*.toml`), connected as
-   `oauth` or `api_key`;
-3. **stop, and report.**
+2. a provider manifest Bloom already has — shipped as a file, written here
+   previously, or pulled from the sync store;
+3. **write one**, from the service's own documentation, with
+   `bloom_write_provider_manifest`;
+4. stop and report — now only when the API is genuinely undocumented, behind a
+   login, or reachable solely through blog posts.
 
-Step 3 is a deliberate outcome, not a gap. The build ends `failed` with a summary
-naming what it found — the service's real API documentation URL, whether it uses
-OAuth or a static key — and creates nothing. No agent, no connection.
+Step 3 is why this document changed. "Adding a provider is a TOML file and a
+redeploy" is fine for two worked examples and wrong as the general answer: there is
+no version of *ship a manifest for every OAuth service* that scales, and it
+contradicts the premise that a capability is a row in a table rather than a repo and
+a deploy.
 
-Creating a half-built agent instead was considered and rejected: a Spotify agent
-that cannot reach Spotify is worse than no agent, because it *looks* finished. It
-would sit in the list, answer questions by hallucinating, and the reason would be a
-`pending` connection nobody was looking at.
+Step 4 still exists and still creates nothing. A manifest written from guesses is
+worse than no manifest — it looks finished and fails later, in front of a user, with
+a credential attached.
 
-The gap this leaves is real: adding a provider is still a human writing a TOML file
-and redeploying. What follows is how that might change.
+## Where they live
 
-## Option A — the builder writes the manifest at runtime
+A `provider_manifests` row in `bloom.db`, not a file — the sketch's reasoning held
+up exactly:
 
-Give it a `bloom_write_provider_manifest(name, toml_text)` tool. The TOML is
-validated by the existing `load_manifest_text`, stored in a `provider_manifests`
-table, and `providers.cache_clear()` makes it live inside the same run.
+- `app/providers/` is inside the code tree, so model output written there is
+  destroyed by the next image rebuild;
+- `data/` is the only mounted volume and the only thing `backup-sqlite.sh` covers, so
+  a second writable directory needs a second volume and a second backup path and gets
+  silently lost the first time somebody forgets one;
+- the table gives `run_id` and `created_at` free, and for a model-authored file
+  "which run wrote this" is the first question anyone asks;
+- reverting is `DELETE FROM`, or one button, rather than an ssh session.
 
-**Why it is attractive.** It is the only option that makes "create a Notion agent"
-work end to end with no human code change, which is the whole promise of the
-builder. Everything else leaves a redeploy in the middle.
+Shipped files and stored rows are unioned by `providers()`, and **a file always
+wins**. `spotify.toml` and `github.toml` stay as the reference implementations of
+the format and cannot be redefined by anything a model writes.
 
-**What it costs.**
+## What it costs
 
-- *A model authors the file that defines HTTP calls made with your credentials.* A
-  manifest is not inert data: `register_operations` turns each `[[operations]]`
-  entry into a callable tool, and `CredentialResolver` attaches a live token to
-  every request it makes. The existing load-time validation (`FORBIDDEN_PARAMS`,
-  the header ban, the tool-name rule) is what stands between that and a secret in a
-  log — it was written assuming a human wrote the file, and it holds, but it has
-  never been asked to hold against adversarial input.
-- *`@lru_cache` is process-wide.* `providers()` caches per process, so a manifest
-  written by one worker stays invisible to the others until restart. Correct for a
-  single uvicorn worker, wrong under `--workers N`. Same class of problem as the
-  credential-refresh lock in `app/credentials.py`.
-- *Prompt injection has somewhere to land.* `read_url` returns attacker-controlled
-  text into a context that would then hold a tool for writing API definitions. Today
-  the worst a poisoned page achieves is a badly-chosen MCP server that a human still
-  has to attach a credential to. With this tool it could specify the endpoint.
+Every concern that argued against this is still true. Each is now priced:
 
-**Extra validation it would need**, beyond what `load_manifest` already does:
+**A model authors the file that defines HTTP calls made with your credentials.**
+Unchanged, and it is the real cost. `load_manifest_text(trusted=False)` adds, on top
+of every rule a file manifest already passed: `api_base`/`authorize_url`/`token_url`/
+`revoke_url` must be https and pass the same SSRF host check `read_url` uses; no
+`DELETE` operation; at most 20 operations and 16 KB. The metadata-service case
+(`https://169.254.169.254`) is the one that mattered most — without that check a
+manifest naming it turns `CredentialResolver` into an authenticated client of the
+instance's own identity service, looking like an ordinary provider in every list.
 
-- `api_base` must be `https://` and pass the same SSRF host check `read_url` uses —
-  otherwise a manifest pointing at `http://169.254.169.254` turns the credential
-  resolver into a metadata-service client with a real token in the header;
-- refuse a name that a file-shipped manifest already defines, so a model can never
-  shadow `spotify.toml` — and, more generally, a file must always win over a row;
-- refuse `DELETE` operations outright: a manifest written by a model and used
-  unattended should not be able to delete anything;
-- caps — 20 operations, 16 KB of TOML — because model output is unbounded by nature.
+**`@lru_cache` is process-wide.** Still true, and now deliberate rather than
+overlooked: `providers()` is invalidated by `reload_providers()` on every write, which
+is what makes a manifest live inside the run that wrote it. Under `--workers N` a
+manifest written by one worker is invisible to the others until they reload — the same
+class of problem as the credential-refresh lock in `app/credentials.py`, and Bloom
+still runs one worker.
 
-**Where it should be stored.** A `provider_manifests` table in `bloom.db`, not a
-writable directory. `data/` is the only mounted volume and the only thing
-`backup-sqlite.sh` covers; a second directory needs a second volume and a second
-backup path and gets silently lost on the first redeploy that forgets one.
-`MANIFEST_DIR` is inside the code tree, so writing model output there is destroyed
-by every image rebuild. The table also gives `run_id` and `created_at` for free, and
-for a model-authored file "which run wrote this" is the first question anyone asks.
-Reverting becomes `DELETE FROM` rather than an ssh session.
+**Prompt injection has somewhere to land.** `read_url` returns attacker-controlled
+text into a context that now holds a tool for writing API definitions. This is the
+sharpest remaining edge. What bounds it: the endpoint checks above, and the fact that
+a manifest does nothing until a human attaches a credential — which is where
+`credential_hosts` is surfaced.
 
-## Option B — the builder drafts it, a human commits it
+**Two things replaced the review gate**, and neither is as strong as one:
 
-Same authoring, but the TOML goes into the setup checklist as a reviewable block
-instead of into a table. The human reads it, commits it to `app/providers/`, and
-redeploys.
+- *the credential is the gate*. A manifest is inert until an account is attached, and
+  that was always a human action. What the human lacked was the one fact worth
+  knowing at that moment. `ConnectionOut` now carries `provider_reviewed`,
+  `provider_source` and `credential_hosts` — "your key will be sent to
+  api.example.com" is checkable against the service they meant to connect; a 90-line
+  TOML document is not;
+- *verification*. Validation proves a manifest parses and is safely shaped, never
+  that its `api_base` describes a real API. A successful `POST /connections/{id}/test`
+  is the only evidence that exists, and it marks the manifest verified. Anything
+  unverified says so wherever it is shown.
 
-Safer, and every provider stays in git where it can be reviewed and blamed. The cost
-is that "create a Notion agent" becomes a two-step flow with a deploy in the middle,
-and the second step is easy to never do.
+## Options B and C, and why neither won
 
-## Option C — written but inert until approved
+**B — the builder drafts it, a human commits it.** Safer, and every provider stays in
+git. Rejected because it leaves a deploy in the middle of "create a Notion agent",
+and the second step is the one nobody does. It also fails the actual requirement:
+the goal is never opening the code editor.
 
-The middle: the builder writes to the table, but the row is marked `pending_review`
-and `providers()` skips it until someone approves it in Aperture. Autonomous
-end-to-end, with one human gate on the security-sensitive artifact.
+**C — written but inert until approved in Aperture.** The document's own preferred
+answer, and still the better security posture. Not built, because "inert until
+approved" needs a review surface before *anything* works end to end, and the thing it
+protects against — a manifest whose `api_base` is wrong or hostile — is now surfaced
+at the credential form instead, which is a screen the user is already on. The
+`review_manifest` checklist step is C's approval gesture without the block: it puts
+the definition and its hosts in front of someone before they connect an account, and
+does not stop them.
 
-This is probably the right eventual answer. It needs a real review surface — a diff
-view in Aperture, and an approve/reject endpoint — which is more UI than the feature
-has earned yet. Note that the checklist already *is* an approval surface by accident;
-making it one on purpose is most of the work.
+If prompt injection through `read_url` ever produces a real incident, C is the
+correction, and `PUT /admin/manifests/{name}` is most of its plumbing already.
+
+## Sharing
+
+Manifests travel through the sync store's `/manifests`, the same way model keywords
+travel through `/models` — a manifest written on one install is research and model
+spend every other install would otherwise repeat.
+
+The store treats the TOML as **opaque**: it does not parse it and must not start,
+because the format's rules live in Bloom and are versioned with Bloom. So a pulled
+manifest is untrusted input and goes through `trusted=False` exactly like a local
+one. Travelling confers nothing.
+
+**Local always wins.** A pull never overwrites a manifest this install has, which is
+what makes `PUT /admin/manifests/{name}` trustworthy: a correction made in Aperture
+cannot be silently undone by a background pass an hour later. `verified` travels as
+advice — some install proved this live — and a puller still starts unverified until
+its own credential probes successfully.
 
 ## The related gap: `requires_confirmation`
 
-All three options would be better with a human-approval step at the moment of the
-call rather than at the moment of authoring. The ecosystem has the mechanism —
-`agent_mcp` gates a tool on an inbound `X-Confirmed: true` — and no way to produce
-it: Amber's wire protocol has no tool-approval frame. `run_task` has been waiting on
-the same thing since it was written. When that frame lands, revisit this whole
-document; it changes the trade in Option A materially.
+Unchanged, and it is what Option C is really waiting for. The ecosystem has the
+mechanism — `agent_mcp` gates a tool on an inbound `X-Confirmed: true` — and no way
+to produce it: Amber's wire protocol has no tool-approval frame. `run_task` has been
+waiting on the same thing since it was written. When that frame lands, an approval
+step at the moment of the *call* would be strictly better than one at the moment of
+authoring, and this document should be revisited.
+
+## Still open
+
+- **Operation quality.** The endpoint checks bound the damage a manifest can do;
+  nothing bounds how *wrong* its operations can be short of a live probe. A wrong
+  path fails at the first call. `allow_request` is the honest escape when the API is
+  too irregular to model, and `PUT` is the fix when it is merely wrong.
+- **Deeper verification.** The probe proves the credential and the API base. It does
+  not exercise any declared operation, so a manifest can be verified and still have a
+  broken `run_report`.
+- **Multi-worker cache invalidation**, if Bloom ever runs more than one.

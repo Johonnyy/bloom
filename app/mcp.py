@@ -5,9 +5,16 @@ every other repo in the ecosystem mounts. It is the reason Bloom exists: Amber
 hands a task here rather than carrying a Spotify integration herself, and MCP is
 how she does it.
 
-So the tool list is deliberately short. One action — ``run_task`` — plus read-only
-surfaces that let a caller find out which agents exist before choosing one. Broad
-capability lives in the *configured agents*, not in this server's own tool list.
+So the tool list is deliberately short: ``run_task`` to use an agent, ``build_agent``
+and ``edit_agent`` to author one, plus read-only surfaces that let a caller find out
+which agents exist before choosing. Broad capability lives in the *configured
+agents*, not in this server's own tool list.
+
+``edit_agent`` is here because without it the answer to "give the Spotify agent
+permission to skip" was a rebuild, which cannot work — a scope belongs to the
+connection, and a new agent attached to the same connection inherits the same grant.
+Its docstring says so at length for the same reason the builder's prompt does: the
+wrong move is the one a model reaches for unprompted.
 
 Everything is configured by injection from `app.config`, never from ``AGENT_MCP_*``
 environment variables — Bloom has one config surface, and the most damaging thing
@@ -34,7 +41,7 @@ from agent_mcp import AgentMCPServer, AgentMCPSettings, current_call
 
 from app.builder import is_builder
 from app.builder.checklist import render as render_checklist
-from app.builder.service import start_build
+from app.builder.service import UnknownAgent, edit_brief, resolve_edit_target, start_build
 from app.config import Settings, get_settings
 from app.db import get_store
 from app.runtime_service import execute_run
@@ -229,7 +236,9 @@ def build_server(settings: Settings | None = None) -> AgentMCPServer:
         browser. The returned ``instructions`` field is written to be read aloud.
 
         Call ``list_agents`` first. An agent that already exists should be used with
-        ``run_task``, not rebuilt.
+        ``run_task``, or changed with ``edit_agent`` — never rebuilt. Rebuilding to
+        gain a permission in particular does not work: the new agent attaches to the
+        same connection and inherits the same grant.
         """
         settings = get_settings()
         reason = settings.builder_unavailable_reason()
@@ -256,6 +265,65 @@ def build_server(settings: Settings | None = None) -> AgentMCPServer:
             # Both shapes, on purpose. The structured list is for a client that can
             # render a button; a model cannot click one, so the prose is what it
             # actually uses.
+            "setup_steps": build["checklist"],
+            "instructions": render_checklist(
+                build["summary"], build["checklist"], agent_slug=build["agent_slug"]
+            ),
+            "error": build["error"],
+        }
+
+    @mcp.tool(read_only=False)
+    async def edit_agent(agent_slug: str, change: str) -> dict:
+        """Change an agent that already exists — its instructions, its model, or the
+        permissions it acts with.
+
+        Use this whenever an agent *nearly* does what was asked. "Let the Spotify
+        agent skip tracks", "stop the research agent using the expensive model",
+        "tell it to always cite sources" are all this tool. **Do not answer such a
+        request with ``build_agent``** — a second agent attached to the same account
+        inherits exactly the same permissions as the first, so rebuilding is the one
+        response guaranteed not to help.
+
+        Widening a permission cannot be completed without a person. An OAuth
+        provider grants scopes when someone approves them at a consent screen, so
+        the reply carries a link and the setup steps; relay them, and say the change
+        is not live until the account is re-authorised. Reporting it as done when
+        the returned ``status`` is ``needs_setup`` tells the user something works
+        when it does not.
+
+        ``changes`` lists what was actually altered. If it is empty the edit failed,
+        whatever the summary reads like.
+        """
+        settings = get_settings()
+        reason = settings.builder_unavailable_reason()
+        if reason:
+            return {"error": reason}
+
+        try:
+            agent = await asyncio.to_thread(resolve_edit_target, agent_slug)
+        except UnknownAgent as exc:
+            # A value rather than a raise, like the unavailable case above: the
+            # caller's turn survives and it can call `list_agents` and try again.
+            return {"error": str(exc)}
+
+        scope = current_call()
+        build = await start_build(
+            edit_brief(agent["slug"], change),
+            origin="mcp",
+            mode="edit",
+            agent=agent,
+            conversation_id=scope.conversation_id if scope else "",
+            depth=scope.depth if scope else 0,
+            caller=scope.caller if scope else "local",
+            settings=settings,
+        )
+        return {
+            "build_id": build["id"],
+            "run_id": build["run_id"],
+            "status": build["status"],
+            "agent_slug": build["agent_slug"],
+            "changes": build["changes"],
+            "summary": build["summary"],
             "setup_steps": build["checklist"],
             "instructions": render_checklist(
                 build["summary"], build["checklist"], agent_slug=build["agent_slug"]
