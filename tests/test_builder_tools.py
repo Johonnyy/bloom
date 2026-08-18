@@ -726,3 +726,63 @@ def test_the_manifest_format_reference_is_available_as_a_tool(broker):
     out = call(broker, "bloom_list_manifest_format")
     assert "[operations.params]" in out
     assert "Keep [probe] and [[operations]] last" in out
+
+
+# --- read_url only reads what the run was actually shown ----------------------
+
+
+def test_read_url_refuses_a_url_the_run_was_never_shown(store):
+    """A guessed URL's 404 is a fact about the model, not about the service.
+
+    The failure this closes: a build searched for a Spotify MCP server, read a
+    plausible repository URL that appeared in none of the results, took the 404 as
+    evidence that Spotify had no documentation, and stopped without ever opening
+    developer.spotify.com.
+    """
+    store.create_build(build_id="b1", run_id="r1", brief="a spotify agent")
+    b = builder_broker(store, _settings(), run_id="r1")
+
+    out = call(b, "read_url", url="https://github.com/akutishevsky/spotify-mcp")
+    assert "Refused" in out
+    assert "came from memory" in out
+    # And it says what to do instead, since the model has to recover inside the run.
+    assert "Search for the page first" in out
+
+
+def test_a_url_in_the_brief_is_evidence_the_model_did_not_invent(store):
+    """The guard's best case must not be its first false positive.
+
+    Nothing is fetched here — a refusal is returned before a client is built, so
+    reaching the network layer at all is the assertion.
+    """
+    store.create_build(build_id="b1", run_id="r1", brief="wrap https://api.example.com/docs")
+    b = builder_broker(store, _settings(), run_id="r1", brief="wrap https://api.example.com/docs")
+
+    out = call(b, "read_url", url="https://api.example.com/docs")
+    assert "came from memory" not in out
+
+
+def test_an_empty_registry_points_at_the_service_api_rather_than_a_dead_end(store):
+    """Where the build actually went wrong, in the one text a weak model reliably reads.
+
+    This branch used to end with "use a provider manifest Bloom already ships" —
+    advice that stopped being possible when Bloom stopped shipping any, leaving the
+    model with no next step but to give up.
+    """
+    from app.builder import mcp_registry
+
+    async def _none(*a, **kw):
+        return [], ""
+
+    original = mcp_registry.search
+    mcp_registry.search = _none
+    try:
+        store.create_build(build_id="b1", run_id="r1", brief="a spotify agent")
+        b = builder_broker(store, _settings(), run_id="r1")
+        out = call(b, "mcp_registry_search", query="spotify")
+    finally:
+        mcp_registry.search = original
+
+    assert "says NOTHING about the service's own API" in out
+    assert "write one" in out
+    assert "already ships" not in out

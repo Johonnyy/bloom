@@ -242,6 +242,7 @@ def build_runner(
     recorder: RunRecorder,
     settings: Settings | None = None,
     store: Store | None = None,
+    prompt: str = "",
 ) -> tuple[AgentRunner, Callable[[], Awaitable[None]]]:
     """Assemble the runner for one run, and the coroutine that tears it down."""
     settings = settings or get_settings()
@@ -260,7 +261,7 @@ def build_runner(
     if is_builder(config) and settings.feature_builder:
         from app.builder.tools import builder_broker
 
-        brokers.append(builder_broker(store, settings, run_id=recorder.run_id))
+        brokers.append(builder_broker(store, settings, run_id=recorder.run_id, brief=prompt))
 
     # Credential tools next: a peer server must never be able to shadow a tool
     # that carries the user's own account access.
@@ -409,7 +410,9 @@ async def execute_run(
         agent_slug=config["slug"], origin=origin, model_tier=config.get("model_tier", "")
     )
 
-    runner, aclose = build_runner(config, recorder=recorder, settings=settings, store=store)
+    runner, aclose = build_runner(
+        config, recorder=recorder, settings=settings, store=store, prompt=prompt
+    )
 
     async def on_sentence(sentence: str) -> None:
         # Non-blocking by construction: this is awaited inside the generation loop.

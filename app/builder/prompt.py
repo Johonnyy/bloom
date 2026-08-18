@@ -119,8 +119,12 @@ This is the third option, not the first, and it is real work: you are defining t
 HTTP calls Bloom will make with somebody's credential. Do it properly.
 
 1. Research the API **from its own documentation**, with web_search and read_url. \
-Find the authorize and token endpoints, the API base, the exact scope strings, and \
-the paths for the two or three operations the brief actually needs.
+Search for the service's developer documentation by name — "spotify web api \
+documentation", not "spotify MCP server", which is the previous question and already \
+answered. Then read pages on the vendor's own domain. Find the authorize and token \
+endpoints, the API base, the exact scope strings, and the paths for the operations \
+the brief actually needs. Expect this to take several reads: the endpoints, the \
+scopes and the paths are rarely on one page.
 2. Call bloom_list_manifest_format. The format has constraints you cannot infer, \
 and one of them silently produces a provider with no scopes rather than an error.
 3. Write it with bloom_write_provider_manifest, then create the connection \
@@ -148,6 +152,15 @@ If you cannot find real documentation — the API is undocumented, or behind a l
 or you can only find blog posts about it — stop and say so. Report what you did \
 find, and create nothing. A manifest written from guesses is worse than no manifest: \
 it looks finished, and it fails in front of the user with a credential attached.
+
+**You may not reach that conclusion without having read the vendor's own \
+documentation.** An empty MCP registry says nothing about whether a service has an \
+API, and a 404 on a URL you guessed says nothing at all — read_url refuses a URL \
+you have not seen in this run, precisely so a guess cannot be mistaken for a \
+finding. "No MCP server, and I could not find documentation" is only true after \
+web_search on the service's documentation and read_url on a page it returned. A \
+major consumer API almost always has a public reference; if your search did not \
+surface it, search differently before concluding it does not exist.
 
 A brief that needs no external service at all — a writing assistant, a summariser \
 — is not any of this. Create it with no connection and carry on.

@@ -6,7 +6,7 @@ returned verbatim by the `bloom_list_manifest_format` tool.
 
 **Why a tool and not a paragraph in the system prompt.** Every build pays for the
 system prompt, and most builds never write a manifest — the MCP registry or a
-shipped provider answers first. Two hundred lines of TOML reference on every run,
+provider manifest Bloom already has answers first. Two hundred lines of TOML reference on every run,
 to be used by one in five, is exactly the bloat that makes a prompt stop being read.
 As a tool it is fetched by the builds that need it.
 
@@ -47,7 +47,7 @@ itself; a parameter that could carry one would put it in the trace.
 the most recently opened table, so a `scopes_default` written after [probe] \
 silently becomes `probe.scopes_default` and the provider quietly gets no scopes. \
 **Keep [probe] and [[operations]] last.** This has already happened once, to the \
-shipped Spotify manifest.
+Spotify manifest that used to ship with Bloom.
 
 ## Read, do not recall
 

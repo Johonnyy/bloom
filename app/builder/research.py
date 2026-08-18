@@ -40,7 +40,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from app.builder.htmltext import extract
 from app.config import Settings, get_settings
@@ -138,6 +140,63 @@ def _format_results(query: str, payload: dict) -> str:
     if not lines:
         return f"No results for {query!r}."
     return "\n".join(lines).strip()
+
+
+#: Matches an http(s) URL in free text. Deliberately loose on what it accepts and
+#: strict in `_normalise_url` about what it stores, because this feeds a membership
+#: test: over-collecting costs nothing, under-collecting refuses a legitimate read.
+_URL_IN_TEXT = re.compile(r"https?://[^\s<>\"'\)\]}]+", re.IGNORECASE)
+
+#: Trailing characters that are almost always prose rather than part of the address.
+_URL_TRAILING = ".,;:!?'\"`)]}>"
+
+
+def normalise_url(url: str) -> str:
+    """A URL reduced to what makes two references the same page.
+
+    Scheme and host lowercased, a trailing slash and any fragment dropped. The query
+    is kept: `?version=2` is a different page and treating it as the same one would
+    silently widen the check this exists to support.
+    """
+    url = (url or "").strip().rstrip(_URL_TRAILING)
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url.lower()
+    if not parts.scheme or not parts.netloc:
+        return url.lower()
+    path = (parts.path or "").rstrip("/")
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, parts.query, ""))
+
+
+def urls_in(text: str) -> set[str]:
+    """Every http(s) URL appearing in some text, normalised."""
+    return {normalise_url(m.group(0)) for m in _URL_IN_TEXT.finditer(text or "")} - {""}
+
+
+def url_was_seen(url: str, seen: set[str]) -> bool:
+    """Whether this URL was shown to the run, rather than recalled by the model.
+
+    A bare origin (`https://developer.spotify.com`) passes when any page on that host
+    has been seen: trimming a known URL back to its site is navigation, not
+    invention, and it is how a model reaches a documentation index. Anything with a
+    path must match a URL that was actually shown.
+    """
+    target = normalise_url(url)
+    if not target:
+        return False
+    if target in seen:
+        return True
+    try:
+        parts = urlsplit(target)
+    except ValueError:
+        return False
+    if parts.path in ("", "/"):
+        host = parts.netloc.lower()
+        return any(urlsplit(s).netloc.lower() == host for s in seen if s)
+    return False
 
 
 async def read_url(

@@ -96,12 +96,15 @@ def builder_broker(
     settings: Settings | None = None,
     *,
     run_id: str,
+    brief: str = "",
     client_factory: Any = None,
 ) -> LocalToolBroker:
     """Build the broker for one builder run.
 
     ``run_id`` is closed over rather than passed as a tool argument — it is the join
     from a checklist back to the build row, and a model has no business choosing it.
+    ``brief`` is here only to seed the seen-URL set below: a link the human wrote is
+    evidence, and refusing to read it would be the guard misfiring on its best case.
     ``client_factory`` exists so a test can drive the whole path without a network.
     """
     settings = settings or get_settings()
@@ -110,11 +113,32 @@ def builder_broker(
     from app.builder import mcp_registry, research
 
     # --- research -------------------------------------------------------------
+    #
+    # Every URL this run has actually been shown, normalised. `read_url` refuses
+    # anything absent from it, which is a narrow rule aimed at one observed failure:
+    # a build searched for a Spotify MCP server, then read
+    # `github.com/akutishevsky/spotify-mcp` — a plausible URL that appeared in none
+    # of the results — took the 404 as evidence that no documentation existed, and
+    # stopped without ever opening developer.spotify.com. A remembered URL is a
+    # guess wearing the costume of a citation: it costs a step, and its failure
+    # reads like a fact about the world rather than a fact about the model.
+    #
+    # Populated from what tools *return*, page text included, so following a link
+    # printed on a page that was read still works. The brief is seeded too — a URL
+    # the human supplied is evidence by a route the model did not invent.
+    seen_urls: set[str] = set()
+
+    def _remember_urls(text: str) -> None:
+        seen_urls.update(research.urls_in(text))
+
+    _remember_urls(brief or "")
 
     async def _web_search(query: str, max_results: int = 5) -> str:
-        return await research.web_search(
+        out = await research.web_search(
             query, max_results=max_results, settings=settings, client_factory=client_factory
         )
+        _remember_urls(out)
+        return out
 
     broker.register(
         "web_search",
@@ -135,13 +159,26 @@ def builder_broker(
     )
 
     async def _read_url(url: str) -> str:
-        return await research.read_url(url, settings=settings, client_factory=client_factory)
+        if not research.url_was_seen(url, seen_urls):
+            return (
+                f"Refused: {url!r} has not appeared in any result this run, so it "
+                "came from memory rather than from evidence. Search for the page "
+                "first and read a URL the search actually returned. If a search for "
+                "this service's documentation finds nothing, that is a finding worth "
+                "reporting — a guessed URL returning 404 is not."
+            )
+        out = await research.read_url(url, settings=settings, client_factory=client_factory)
+        _remember_urls(out)
+        return out
 
     broker.register(
         "read_url",
         "Read the main text of one web page. Use it on an API reference or an MCP "
-        "server's repository README before you decide anything. Never invent a URL — "
-        "use one from a search result. Local and private addresses are refused.",
+        "server's repository README before you decide anything. The URL must be one "
+        "you have SEEN in this run — a search result, a registry entry, a link on a "
+        "page you read, or the brief. A URL from memory is refused, not fetched: it "
+        "is a guess, and its 404 tells you nothing about the service. Local and "
+        "private addresses are refused too.",
         {
             "type": "object",
             "properties": {"url": {"type": "string", "description": "A full http(s) URL."}},
@@ -159,9 +196,14 @@ def builder_broker(
             return error
         if not candidates:
             return (
-                f"The MCP registry has nothing for {query!r}. That is a real answer: "
-                "no MCP server exists for this service, so use a provider manifest "
-                "Bloom already ships, or report that neither is available."
+                f"The MCP registry has nothing for {query!r}. That is a real answer "
+                "about MCP servers and says NOTHING about the service's own API. "
+                "Bloom ships no provider manifests, so this is the normal case, not "
+                "a dead end: check bloom_list_providers, and if there is no manifest "
+                "either, research the service's own developer documentation with "
+                "web_search and read_url and write one. Do not report that a service "
+                "is unreachable until you have read its API reference and found it "
+                "genuinely undocumented or unauthenticated."
             )
         usable = [c for c in candidates if c.usable]
         header = (
@@ -175,7 +217,8 @@ def builder_broker(
         "mcp_registry_search",
         "Search the official MCP Registry. CALL THIS BEFORE considering any other "
         "way to reach a service. Each result carries a computed `usable` verdict and, "
-        "when unusable, the reason — an unusable server is a dead end, not a fallback.",
+        "when unusable, the reason — an unusable server is a dead end for that server, "
+        "not for the service: the next step is the service's own API, never stopping.",
         {
             "type": "object",
             "properties": {

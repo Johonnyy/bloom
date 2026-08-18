@@ -247,3 +247,52 @@ def test_malformed_markup_yields_what_parsed_rather_than_raising():
     swallowed_title, swallowed_text = extract("<html><title>Half<body><p>lost")
     assert "Half" in swallowed_title
     assert swallowed_text == ""
+
+
+# --- a URL from memory is not a citation --------------------------------------
+
+
+def test_a_url_is_normalised_to_what_makes_two_references_the_same_page():
+    """Case and a trailing slash are noise; a query string is not."""
+    same = research.normalise_url("HTTPS://Developer.Spotify.com/Documentation/")
+    assert same == research.normalise_url("https://developer.spotify.com/Documentation")
+    assert research.normalise_url("https://x.example/a?v=2") != research.normalise_url(
+        "https://x.example/a"
+    )
+    # Trailing prose punctuation is stripped: these arrive from inside sentences.
+    assert research.normalise_url("https://x.example/a).") == research.normalise_url(
+        "https://x.example/a"
+    )
+
+
+def test_urls_are_collected_out_of_whatever_a_tool_returned():
+    """Search results, registry entries and page text all count as having been shown."""
+    found = research.urls_in(
+        "endpoint: https://spotify.api.example.ai/mcp\n"
+        "repository: https://github.com/example/thing (v1)"
+    )
+    assert "https://spotify.api.example.ai/mcp" in found
+    assert "https://github.com/example/thing" in found
+
+
+def test_a_url_that_was_never_shown_is_not_seen():
+    """The exact failure: a plausible repository URL in none of the results.
+
+    A build searched for a Spotify MCP server, read
+    `github.com/akutishevsky/spotify-mcp`, took its 404 as evidence that the service
+    had no documentation, and stopped without opening developer.spotify.com. Sharing
+    a host with something real is what makes such a URL plausible, so a host match
+    must not be enough to pass.
+    """
+    seen = research.urls_in("see https://github.com/trendsmcp/Trends-MCP for details")
+    assert research.url_was_seen("https://github.com/trendsmcp/Trends-MCP", seen)
+    assert not research.url_was_seen("https://github.com/akutishevsky/spotify-mcp", seen)
+
+
+def test_trimming_a_seen_url_back_to_its_site_is_navigation_not_invention():
+    """How a model reaches a documentation index it was shown a leaf of."""
+    seen = research.urls_in("https://developer.spotify.com/documentation/web-api/concepts")
+    assert research.url_was_seen("https://developer.spotify.com", seen)
+    assert research.url_was_seen("https://developer.spotify.com/", seen)
+    # A different host, trimmed the same way, is still a guess.
+    assert not research.url_was_seen("https://api.spotify.com", seen)

@@ -435,6 +435,20 @@ merges. A rebuilt agent never adds a tool — the tools come from the provider, 
 per run in `runtime_service.py` — so an agent picks up new operations on its next run
 with no rebuild and no reconnect.
 
+**`read_url` only reads what the run was shown.** `builder_broker` keeps a set of
+every URL surfaced by a tool result this run — search results, registry entries, the
+text of pages already read — seeded with the brief, and refuses anything absent from
+it. The rule is narrow and aimed at one observed failure: a build searched for a
+Spotify MCP server, read `github.com/akutishevsky/spotify-mcp` (a plausible URL in
+none of the results), took the 404 as evidence that Spotify had no documentation, and
+stopped without opening `developer.spotify.com`. A remembered URL is a guess wearing
+the costume of a citation, and its 404 reads like a fact about the world. Trimming a
+seen URL back to its own origin still passes, because reaching a documentation index
+from a leaf is navigation rather than invention. The prompt's matching half: the
+builder may not report "no documentation" without a successful read on the vendor's
+own domain, and an empty MCP registry is explicitly told to say nothing about whether
+the service has an API.
+
 `BLOOM_MANIFEST_SEED_DIR` (unset by default) imports `*.toml` from a directory as
 ordinary rows: never overwriting a name that already exists, and producing something
 editable exactly like one the builder wrote. It is how the tests get their two worked
