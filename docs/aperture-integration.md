@@ -56,7 +56,7 @@ to that slug is the agent's change history. Two differences worth rendering:
   "updated" without surfacing it tells the user a permission is live when it is not.
 
 `Build.status` is `running | needs_setup | ready | failed`. **`failed` is sometimes
-the correct answer** — no usable MCP server and no shipped manifest means the builder
+the correct answer** — no usable MCP server and no existing manifest means the builder
 reports what it found and creates nothing, and `summary` is where the reason lives.
 
 `checklist[]` steps are typed so a client renders each as the control that completes
@@ -87,12 +87,15 @@ PUT    /admin/manifests/{name}   {toml}  200 → Manifest   (422 with the parser
 DELETE /admin/manifests/{name}           204
 ```
 
-**A provider is no longer necessarily code.** The builder writes manifests at runtime
+**A provider is never code.** The builder writes manifests at runtime
 from a service's own documentation, because shipping a TOML file per OAuth service
-does not scale. `source` says which kind each one is: `file` (shipped, reviewed,
-read-only), `stored` (written on this install), `shared` (pulled from the sync store).
-`editable` is the flag to render from — it is false exactly for shipped files, which
-should read as read-only rather than 404.
+does not scale. `source` says where each one came from: `stored` (written by the
+builder here), `shared` (pulled from the sync store), or `seed` (imported from a
+directory). None of them has been reviewed by a human and `reviewed` is false for
+all of them, so `credential_hosts` — the hosts a key will actually be sent to — is
+what the connection form must lead with. `editable` is true for every manifest;
+Bloom no longer ships any as code, because a manifest that could not be edited was
+a capability that needed a redeploy.
 
 **`PUT` is the feature, not a CRUD nicety.** A model-authored operation will sometimes
 have the wrong path or a scope string that does not exist, and the whole point of

@@ -269,9 +269,9 @@ def builder_broker(
         for provider in sorted(found.values(), key=lambda p: p.name):
             ops = ", ".join(op.tool_name(provider.name) for op in provider.operations)
             origin = {
-                "file": "shipped",
                 "stored": "written here",
                 "shared": "from another install",
+                "seed": "imported here",
             }.get(provider.source, provider.source)
             lines.append(
                 f"- {provider.name} ({provider.display_name}) [{origin}] — auth: "
@@ -281,9 +281,13 @@ def builder_broker(
             "Provider manifests this Bloom can already use. If the service is here, "
             "use it rather than writing a second definition of the same thing.\n"
             + "\n".join(lines)
-            + "\n\nA service that is NOT here is not a dead end: if the MCP registry "
-            "has nothing usable either, write a manifest for it with "
-            "bloom_write_provider_manifest."
+            + "\n\nRead the tool lists before you rely on one. A manifest that exists "
+            "is not necessarily one that covers the brief, and the fix for a missing "
+            "operation is to extend that manifest: bloom_get_provider_manifest for "
+            "the current TOML, then bloom_write_provider_manifest under the same "
+            "name. Rebuilding an agent never adds a tool.\n\nA service that is NOT "
+            "here is not a dead end either: if the MCP registry has nothing usable, "
+            "write a manifest for it."
         )
 
     broker.register(
@@ -434,6 +438,52 @@ def builder_broker(
         read_only=True,
     )
 
+    async def _get_manifest(name: str) -> str:
+        """The TOML of one manifest, so it can be extended rather than replaced blind.
+
+        The gap this closes: `bloom_list_providers` prints a summary line, and the
+        write tool replaces wholesale. Without the source, "add skip to Spotify" had
+        no expressible form. Re-deriving the whole manifest from the docs to change
+        one thing is how operations that already worked get dropped.
+        """
+        wanted = (name or "").strip().lower()
+        provider = get_provider(wanted)
+        if provider is None:
+            known = ", ".join(sorted(providers())) or "(none)"
+            return (
+                f"No provider manifest named {wanted!r}. This Bloom has: {known}. "
+                "If the service genuinely has no manifest, write one with "
+                "bloom_write_provider_manifest."
+            )
+        row = await asyncio.to_thread(store.get_manifest, wanted)
+        if row is None:
+            return (
+                f"{wanted!r} is loaded but has no stored row, which should not happen. "
+                "Treat it as absent and report it rather than overwriting it blind."
+            )
+        ops = ", ".join(op.tool_name(provider.name) for op in provider.operations)
+        return (
+            f"Manifest {wanted!r} ({provider.display_name}), source={provider.source}.\n"
+            f"Tools it contributes now: {ops or '(none)'}\n"
+            "Editing it means sending the WHOLE document back with "
+            "bloom_write_provider_manifest under this same name. It replaces rather "
+            "than merges: every operation you want to keep must still be present.\n\n" + row["toml"]
+        )
+
+    broker.register(
+        "bloom_get_provider_manifest",
+        "The full TOML of a manifest this Bloom already has. Call it before editing "
+        "one: bloom_write_provider_manifest replaces the whole document, so extending "
+        "a provider means reading it, adding operations, and sending all of it back.",
+        {
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "The provider name."}},
+            "required": ["name"],
+        },
+        _get_manifest,
+        read_only=True,
+    )
+
     async def _write_manifest(name: str, toml: str) -> str:
         from app import manifests
 
@@ -483,11 +533,15 @@ def builder_broker(
 
     broker.register(
         "bloom_write_provider_manifest",
-        "Teach this Bloom to reach a service it has no manifest for, by writing one. "
-        "Use it ONLY after bloom_list_providers showed no manifest and the MCP "
-        "registry had nothing usable — this is the third option, not the first. "
-        "Every URL, scope and path in it must come from a page you read with "
-        "read_url, never from memory. Writing the same name again replaces it.",
+        "Write a provider manifest: how Bloom reaches one service's API with a "
+        "credential. Two uses. NEW service — only after bloom_list_providers showed "
+        "no manifest and the MCP registry had nothing usable, which makes it the "
+        "third option rather than the first. EXTENDING an existing one — when the "
+        "manifest is there but lacks an operation the brief needs, which is a normal "
+        "edit and the correct fix; read it with bloom_get_provider_manifest first, "
+        "because writing a name again REPLACES the whole document and any operation "
+        "you omit is deleted. Every URL, scope and path must come from a page you "
+        "read with read_url, never from memory.",
         {
             "type": "object",
             "properties": {

@@ -89,6 +89,30 @@ Use a provider manifest Bloom already has — bloom_list_providers tells you whi
 including ones written here or shared by another install — and create an `oauth` \
 or `api_key` connection against it.
 
+**Check it actually covers the brief before you use it.** bloom_list_providers \
+prints the tools each manifest contributes. If the ones the brief needs are not in \
+that list the manifest is incomplete. An existing manifest is not a finished one, \
+and this is the most common way a build ends with an agent that cannot do the \
+thing it was asked for.
+
+## If a manifest exists but is missing operations, extend it
+
+Do this rather than anything else. Not a second manifest under another name, and \
+**never** a rebuilt agent: the missing capability is in the provider definition, so \
+neither of those touches the actual problem, and a rebuild re-runs an OAuth grant \
+the user already gave.
+
+1. bloom_get_provider_manifest gives you the current TOML.
+2. Research the missing endpoints in the service's own documentation, exactly as \
+you would for a new manifest.
+3. Send the **whole** manifest back with bloom_write_provider_manifest under the \
+same name: the original operations plus the new ones. It replaces rather than \
+merges, so anything you leave out is deleted.
+4. Every agent using that provider picks up the new tools on its next run. There is \
+nothing to rebuild and no connection to recreate. If the new operations need a \
+scope the existing grant lacks, say so and hand back a reconnect link. A scope is \
+granted by the person, not by you.
+
 ## If there is no manifest either, write one
 
 This is the third option, not the first, and it is real work: you are defining the \
@@ -99,8 +123,8 @@ Find the authorize and token endpoints, the API base, the exact scope strings, a
 the paths for the two or three operations the brief actually needs.
 2. Call bloom_list_manifest_format. The format has constraints you cannot infer, \
 and one of them silently produces a provider with no scopes rather than an error.
-3. Write it with bloom_write_provider_manifest. Then create the connection against \
-it exactly as you would against a shipped provider — it is live immediately.
+3. Write it with bloom_write_provider_manifest, then create the connection \
+against it — it is live immediately, inside this run.
 4. Put a `review_manifest` step on the checklist naming the provider, and say in \
 your summary which hosts a credential will be sent to. You wrote this definition \
 from pages you read; the person connecting their account is the only one who knows \

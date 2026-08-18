@@ -25,8 +25,9 @@ Three shapes are deliberate:
   simply stop being registered until a manifest for that name exists again, which
   is what makes "delete it and let the builder try again" a safe recovery.
 
-A shipped file is visible here but not writable: `app.manifests.writable_name`
-refuses those names, so `spotify.toml` reads as read-only rather than 404ing.
+Every manifest here is writable. Bloom used to ship two as reviewed files that no
+row could redefine, which made a gap in one of them a pull request; see
+`app.manifests`. Nothing is read-only any more.
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ from app import manifests as manifest_store
 from app.admin.deps import require_admin
 from app.db import get_store
 from app.errors import ApiError
-from app.providers import ManifestError, file_providers, providers
+from app.providers import ManifestError, providers
 
 logger = logging.getLogger(__name__)
 
@@ -73,12 +74,12 @@ class OperationOut(BaseModel):
 class ManifestOut(BaseModel):
     name: str
     display_name: str
-    # file | stored | shared. `file` is reviewed code and cannot be edited here.
+    # stored | shared | seed. All three are editable; none has been reviewed.
     source: str
     editable: bool
-    # Whether a human has read this definition. False for anything a model wrote —
-    # surfaced so a UI can say so next to the credential form rather than in a
-    # settings page nobody opens.
+    # Whether a human has read this definition. Always false now that nothing is
+    # shipped as reviewed code; kept so a UI states it next to the credential form
+    # rather than implying review by saying nothing.
     reviewed: bool
     verified_at: str | None = None
     verified_note: str = ""
@@ -91,7 +92,7 @@ class ManifestOut(BaseModel):
     scopes_default: list[str]
     allow_request: bool
     operations: list[OperationOut]
-    # Absent for a shipped file: its text lives in git, not in the database.
+    # Every manifest has one now: there is no definition whose text lives in git.
     toml: str | None = None
     run_id: str = ""
     created_at: str = ""
@@ -184,12 +185,5 @@ async def delete_manifest(name: str) -> None:
     this a safe way to let the builder retry rather than a destructive one.
     """
     name = name.strip().lower()
-    if name in file_providers():
-        raise ApiError(
-            409,
-            "conflict",
-            f"{name!r} is shipped with Bloom as a reviewed file. Deleting it is a code "
-            "change, not an API call.",
-        )
     if not await asyncio.to_thread(manifest_store.delete, name):
         raise ApiError(404, "not_found", f"No stored manifest named {name!r}.")

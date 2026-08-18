@@ -1,15 +1,17 @@
 """Manifests written at runtime: what may be stored, and what may not.
 
-A provider is no longer only a reviewed file — the builder writes them now, so that
-adding an OAuth service stops being a pull request and a redeploy. That trade is
-only acceptable because of the rules asserted here, and each of them exists because
-of a specific way a model-authored manifest could hurt someone:
+A provider is never a reviewed file — the builder writes them all, so that adding
+an OAuth service, or an operation a service was missing, stops being a pull request
+and a redeploy. That trade is only acceptable because of the rules asserted here,
+and each of them exists because of a specific way a model-authored manifest could
+hurt someone:
 
 * **the endpoint checks** stop a manifest aiming a live credential at the cloud
   metadata service or a neighbour on the VPS;
 * **the DELETE refusal** stops one running unattended against something it can
   destroy;
-* **file-wins** stops a stored row redefining where an *existing* connection's
+* **an existing row wins** over anything arriving from the sync store, which
+  stops somebody else's model redefining where an *existing* connection's
   credential goes — the attack that needs no new credential at all;
 * **`safe_path`** is what makes the bounded request tool bounded; without it the
   "locked to api_base" claim is a comment rather than a fact.
@@ -39,6 +41,7 @@ from app.providers import (
     set_stored_loader,
 )
 from app.providers.registry import safe_path
+from tests.conftest import FIXTURE_DIR
 
 
 def _settings(**over) -> Settings:
@@ -83,6 +86,10 @@ WITH_REQUEST = GOOD.replace("\n[probe]", "\nallow_request = true\n\n[probe]")
 def store(tmp_path):
     s = db_module.Store(str(tmp_path / "bloom.db"))
     manifest_store.install_loader(s)
+    # Seeded through the real import path rather than injected: these tests are the
+    # ones that care what a manifest's provenance and editability actually are, and
+    # a shortcut here would let a seeded row look different from a real one.
+    manifest_store.seed_from_dir(FIXTURE_DIR, s)
     yield s
     set_stored_loader(None)
     s.close()
@@ -183,32 +190,55 @@ def test_the_credential_denylist_still_applies_to_a_stored_manifest():
 # --- a file always wins -------------------------------------------------------
 
 
-def test_a_stored_manifest_cannot_claim_a_shipped_name(store):
-    """The attack that needs no new credential: redefine a provider already connected.
+def test_an_existing_manifest_can_be_extended_in_place(store):
+    """The whole point of the change: a gap in a provider is an edit, not a release.
 
-    Someone's Spotify account is already attached. A stored row claiming `spotify`
-    would change where that existing token is sent, with nobody entering anything.
+    Spotify shipped as a file with play, pause, search and now_playing, and no way
+    to skip a track. `writable_name` refused the name, so "add skip" was a pull
+    request and a redeploy on a running box — while the user's own OAuth grant
+    already carried `user-modify-playback-state`. The capability was there; only the
+    definition was missing, and the definition was the one part nobody could reach.
     """
-    refusal = manifest_store.writable_name("spotify")
-    assert "shipped with Bloom" in refusal
+    assert manifest_store.writable_name("spotify") == ""
 
-    with pytest.raises(ManifestError):
-        manifest_store.save(name="spotify", toml=_toml(), store=store)
-    assert store.get_manifest("spotify") is None
-    # And the real Spotify is untouched.
-    assert get_provider("spotify").api_base == "https://api.spotify.com/v1"
+    before = get_provider("spotify")
+    assert "spotify_play" in {op.tool_name("spotify") for op in before.operations}
+    assert "spotify_next" not in {op.tool_name("spotify") for op in before.operations}
+
+    extended = store.get_manifest("spotify")["toml"] + textwrap.dedent(
+        """
+        [[operations]]
+        name = "next"
+        method = "POST"
+        path = "/me/player/next"
+        description = "Skip to the next track."
+        scopes = ["user-modify-playback-state"]
+        """
+    )
+    manifest_store.save(name="spotify", toml=extended, store=store)
+
+    after = get_provider("spotify")
+    names = {op.tool_name("spotify") for op in after.operations}
+    assert "spotify_next" in names
+    # And nothing that already worked was lost on the way.
+    assert "spotify_play" in names
+    assert after.api_base == "https://api.spotify.com/v1"
 
 
-def test_a_row_that_slipped_past_the_write_path_is_still_shadowed_by_the_file(store):
-    """The second half of file-wins, enforced in `providers()` rather than at write.
+def test_extending_replaces_the_whole_document_rather_than_merging(store):
+    """Which is why the tool that reads a manifest exists, and why it says so.
 
-    Belt and braces on purpose: a manifest arriving from the sync store was named by
-    somebody else's model, and that path deserves the guarantee twice.
+    A partial write is not a partial update — it is a deletion of everything left
+    out. Asserted because the failure is silent: the manifest still loads, the
+    connection still works, and one capability quietly stops existing.
     """
-    # Insert directly, bypassing `manifests.save` and its refusal.
-    store.upsert_manifest(name="spotify", toml=_toml(api_base="https://evil.example/v1"))
-    reload_providers()
-    assert get_provider("spotify").api_base == "https://api.spotify.com/v1"
+    manifest_store.save(
+        name="spotify",
+        toml=_toml().replace('name = "analytics"', 'name = "spotify"'),
+        store=store,
+    )
+    names = {op.tool_name("spotify") for op in get_provider("spotify").operations}
+    assert "spotify_play" not in names
 
 
 def test_the_name_in_the_toml_must_match_the_name_it_is_saved_under(store):
@@ -242,9 +272,19 @@ def test_a_stored_provider_reports_where_a_credential_would_go(store):
     assert "auth.example.com" in provider.credential_hosts()
 
 
-def test_a_shipped_provider_is_marked_reviewed(store):
-    assert get_provider("spotify").reviewed is True
-    assert get_provider("spotify").source == "file"
+def test_no_provider_claims_to_have_been_reviewed(store):
+    """Nothing ships as code any more, so nothing may report a human read it.
+
+    The seeded ones are the closest thing left, and they are still text somebody
+    imported rather than text somebody vouched for. `credential_hosts()` is what a
+    person is asked to judge instead.
+    """
+    assert get_provider("spotify").source == "seed"
+    assert get_provider("spotify").reviewed is False
+
+    manifest_store.save(name="analytics", toml=GOOD, store=store)
+    assert get_provider("analytics").source == "stored"
+    assert get_provider("analytics").reviewed is False
 
 
 def test_rewriting_a_manifest_clears_its_verified_mark(store):

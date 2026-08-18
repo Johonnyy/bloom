@@ -117,26 +117,35 @@ def test_a_correction_that_would_not_load_is_refused_with_the_parser_message(cli
     assert get_provider("analytics").api_base == "https://api.example.com/v1"
 
 
-def test_the_listing_shows_shipped_and_stored_together_with_their_provenance(client):
+def test_the_listing_shows_every_manifest_with_its_provenance_and_all_editable(client):
+    """Provenance still differs. Editability no longer does."""
     client.put("/admin/manifests/analytics", headers=AUTH, json={"toml": GOOD})
     rows = {m["name"]: m for m in client.get("/admin/manifests", headers=AUTH).json()}
 
-    assert rows["spotify"]["source"] == "file"
-    assert rows["spotify"]["editable"] is False
-    assert rows["spotify"]["toml"] is None  # its text lives in git, not the database
+    assert rows["spotify"]["source"] == "seed"
     assert rows["analytics"]["source"] == "stored"
-    assert rows["analytics"]["editable"] is True
-    assert rows["analytics"]["toml"] is not None
+    for name in ("spotify", "analytics"):
+        assert rows[name]["editable"] is True
+        assert rows[name]["toml"] is not None  # nothing's text lives in git any more
 
 
-def test_a_shipped_manifest_is_visible_but_not_writable(client):
-    """Read-only rather than 404: it exists, it just is not yours to edit here."""
-    assert client.get("/admin/manifests/spotify", headers=AUTH).status_code == 200
+def test_a_seeded_manifest_is_editable_through_the_api(client):
+    """Principle 2, on the surface where it was most obviously broken.
 
-    refused = client.put("/admin/manifests/spotify", headers=AUTH, json={"toml": GOOD})
-    assert refused.status_code == 409
-    assert "shipped with Bloom" in refused.json()["message"]
-    assert client.delete("/admin/manifests/spotify", headers=AUTH).status_code == 409
+    A seeded manifest arrived from a directory rather than from the builder, which
+    is the closest thing left to "shipped" — and it must still be fixable here,
+    because the alternative is editing a file on the box and restarting.
+    """
+    spotify = client.get("/admin/manifests/spotify", headers=AUTH).json()
+    edited = spotify["toml"].replace(
+        'display_name = "Spotify"', 'display_name = "Spotify (edited)"'
+    )
+    assert edited != spotify["toml"]
+
+    saved = client.put("/admin/manifests/spotify", headers=AUTH, json={"toml": edited})
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["display_name"] == "Spotify (edited)"
+    assert client.delete("/admin/manifests/spotify", headers=AUTH).status_code == 204
 
 
 def test_the_credential_destination_is_reported_where_the_credential_is_entered(client):
@@ -154,13 +163,16 @@ def test_the_credential_destination_is_reported_where_the_credential_is_entered(
     assert body["credential_hosts"][0] == "api.example.com"
 
 
-def test_a_shipped_provider_reports_itself_as_reviewed(client):
+def test_no_provider_reports_itself_as_reviewed(client):
+    """There is no reviewed tier left, and the connection screen must not imply one."""
     created = client.post(
         "/admin/connections",
         headers=AUTH,
         json={"kind": "oauth", "provider": "spotify", "name": "spotify"},
     )
-    assert created.json()["provider_reviewed"] is True
+    body = created.json()
+    assert body["provider_reviewed"] is False
+    assert body["credential_hosts"]  # what is shown in its place
 
 
 def test_deleting_a_manifest_leaves_the_connection_and_its_credential(client):
@@ -277,9 +289,21 @@ def test_a_pull_never_overwrites_a_manifest_this_install_edited(store):
     assert get_provider("analytics").operations[0].path.endswith(":batchRunReports")
 
 
-def test_a_shared_manifest_cannot_claim_a_shipped_name(store):
-    """Named by somebody else's model, so this path deserves the guarantee twice."""
-    hijack = GOOD.replace('name = "analytics"', 'name = "spotify"')
+def test_a_shared_manifest_cannot_redefine_one_this_install_already_has(store):
+    """The protection that remains, and the only one that was ever load-bearing.
+
+    It used to rest on `spotify` being a shipped file. It now rests on this install
+    having a row for that name — which covers strictly more cases, because every
+    provider anyone has actually connected to has one.
+    """
+    manifest_store.save(
+        name="spotify",
+        toml=GOOD.replace('name = "analytics"', 'name = "spotify"'),
+        store=store,
+    )
+    hijack = GOOD.replace('name = "analytics"', 'name = "spotify"').replace(
+        "https://api.example.com/v1", "https://evil.example/v1"
+    )
     payload = {"manifests": {"spotify": {"toml": hijack}}}
     adopted = asyncio.run(
         manifest_sync.pull(
@@ -289,7 +313,7 @@ def test_a_shared_manifest_cannot_claim_a_shipped_name(store):
         )
     )
     assert adopted == 0
-    assert get_provider("spotify").api_base == "https://api.spotify.com/v1"
+    assert get_provider("spotify").api_base == "https://api.example.com/v1"
 
 
 def test_a_shared_manifest_is_validated_exactly_like_a_local_one(store):

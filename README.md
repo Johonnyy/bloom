@@ -93,9 +93,10 @@ All of it, with 342 tests and no network needed to run them.
 - [x] **Provider manifests written at runtime.** Shipping a TOML file per OAuth
       service does not scale, so the builder writes them from the service's own
       docs and they live in the database, not the code tree. Shared through the
-      sync store so one install's research is not repeated. A shipped file always
-      wins, endpoints must be public https, no DELETE, and a wrong one is fixed at
-      `PUT /admin/manifests/{name}` rather than in an editor
+      sync store so one install's research is not repeated. Bloom ships none at
+      all, so every provider is editable — endpoints must be public https, no
+      DELETE, and a wrong or incomplete one is fixed at `PUT /admin/manifests/{name}`
+      or by asking, rather than in an editor and a deploy
 - [x] Editing what it built — `POST /admin/builder/edit` and the `edit_agent` tool,
       covering prompts, keywords, ceilings, attachments and OAuth scopes. A scope
       belongs to the connection, so "let it skip tracks" is an edit, not a rebuild —
@@ -118,22 +119,29 @@ here that made adding a capability a pull request and a redeploy, which is exact
 what Bloom exists to stop. If it gets an operation wrong, fix it at
 `PUT /admin/manifests/{name}` — a form in Aperture, not an editor and a deploy.
 
+**An incomplete manifest is the same conversation.** "Add skip to Spotify" is an
+edit: the builder reads the current TOML, adds the operations, and writes the whole
+document back under the same name. Every agent using that provider has the new tools
+on its next run — a rebuilt agent would not, because tools come from the provider,
+not from the agent.
+
 The rules a written manifest must pass, on top of everything below: endpoints must be
 public HTTPS (a manifest naming `169.254.169.254` would aim your live credential at
 the cloud metadata service), no `DELETE` operations, at most 20 operations and 16 KB.
-A shipped file always beats a stored row, so `spotify` and `github` cannot be
-redefined. Manifests are shared through the sync store, so one install's research is
-not repeated on the next. See
-[docs/provider-manifests-future.md](docs/provider-manifests-future.md) for what the
-trade costs and what pays for it.
+**Bloom ships no manifests**, so there is no name you cannot redefine and no provider
+whose gaps need a release — see
+[docs/provider-manifests-future.md](docs/provider-manifests-future.md) for why the
+two that used to ship were removed. Manifests are shared through the sync store, so
+one install's research is not repeated on the next.
 
-**Writing one by hand** is still a file, not code, and is how the two shipped
-examples work. Copy [app/providers/spotify.toml](app/providers/spotify.toml) (an
-OAuth provider) or [app/providers/github.toml](app/providers/github.toml) (which
-also accepts a pasted key), say which kinds of credential it takes with `auth`, and
-declare one `[[operations]]` block per thing an agent should be able to do. Each becomes a tool
-named `<provider>_<operation>` whose `description` is the only thing the model sees
-— so write it for the model, naming the fields it should read out of the response.
+**Writing one by hand** is a TOML document, not code. Copy either worked example in
+[tests/fixtures/](tests/fixtures/) — `spotify.toml` (OAuth) or `github.toml` (which
+also accepts a pasted key) — say which kinds of credential it takes with `auth`, and
+declare one `[[operations]]` block per thing an agent should be able to do. Each
+becomes a tool named `<provider>_<operation>` whose `description` is the only thing
+the model sees — so write it for the model, naming the fields it should read out of
+the response. Load it with `PUT /admin/manifests/{name}`, or point
+`BLOOM_MANIFEST_SEED_DIR` at the directory holding it.
 
 The loader refuses a manifest that would break something far away: a tool name over
 40 characters or containing `__` (which would collide with MCP's `server__tool`

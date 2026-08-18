@@ -85,6 +85,13 @@ class Settings(BaseSettings):
     # three-way tenancy safe; see app/db.py.
     db_path: str = "data/bloom.db"
 
+    # Optional directory of `*.toml` provider manifests imported as ordinary rows on
+    # startup. Empty by default, and that is the point: Bloom ships no providers, so
+    # nothing it can reach was decided by whoever wrote the repo. Anything imported
+    # here is editable afterwards exactly like one the builder wrote — it is a
+    # starting point, never an override. See `app.manifests.seed_from_dir`.
+    manifest_seed_dir: str = ""
+
     # --- The loop (agent_runtime) ---
     openrouter_api_key: str = Field(
         default="",

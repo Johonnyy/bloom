@@ -8,11 +8,19 @@ the registry is imported by tests and tools that never open a database, so a dir
 import of `app.db` there would make a provider definition require one.
 
 **Why this exists at all.** Adding a provider used to be a TOML file in the code
-tree and a redeploy. That is fine for the two worked examples and wrong as the
-general answer — there is no version of "ship a manifest for every OAuth service"
-that scales, and the whole point of the builder is that a capability is a row in a
-table rather than a repo and a deploy. So the builder writes them, at runtime, from
-the service's own documentation.
+tree and a redeploy. There is no version of "ship a manifest for every OAuth
+service" that scales, and the whole point of the builder is that a capability is a
+row in a table rather than a repo and a deploy. So the builder writes them, at
+runtime, from the service's own documentation.
+
+Bloom kept two of them — `spotify.toml` and `github.toml` — as reviewed worked
+examples that beat any row of the same name. That exemption is gone, because it
+failed in exactly the case it was meant to serve: the two providers most likely to
+already be connected were the two whose gaps could not be repaired by asking. A
+Spotify manifest with no `next` operation made "skip this song" unanswerable, and
+the refusal pointed at a pull request. Every manifest is a row now. The worked
+example the builder needs is `app.builder.manifest_format.FORMAT`, which is a
+*reference*, not a provider — it teaches the shape without deciding what exists.
 
 **What that costs, and what pays for it.** A manifest is not inert data:
 `register_operations` turns each entry into a callable tool and
@@ -22,10 +30,9 @@ stand between that and a bad outcome, and all four matter:
 1. `load_manifest_text(trusted=False)` — https-and-public endpoints, no ``DELETE``,
    bounded size and operation count, on top of every rule a file manifest already
    passes (the tool-name regex, `FORBIDDEN_PARAMS`, the header ban);
-2. **a file always wins.** :func:`writable_name` refuses a name that
-   `file_providers()` defines, and `providers()` overwrites a row with the file
-   regardless — two enforcements in two modules, because only one of them is on
-   the path a manifest arriving from the sync store takes;
+2. **operations are bounded and named.** Every tool a manifest contributes is
+   prefixed with the provider name and shown before a credential is attached, so
+   a manifest cannot quietly grow reach the connection screen did not disclose;
 3. **the credential is the real gate.** A manifest does nothing until someone
    attaches an account to it, and that has always been a human action. What the
    human lacked was the one fact worth knowing at that moment, which
@@ -34,8 +41,8 @@ stand between that and a bad outcome, and all four matter:
    unverified everywhere it is shown, rather than looking identical to one that
    works.
 
-None of that makes a model-authored manifest as trustworthy as a reviewed file, and
-`Provider.source` says which it is everywhere it is surfaced. That is the honest
+`Provider.source` still says where a manifest came from — written here, shared by
+another install, or seeded — everywhere one is surfaced. That is the honest
 position: this trades a review gate for a deploy gate, on purpose, and shows its
 working instead of hiding it.
 """
@@ -43,12 +50,13 @@ working instead of hiding it.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from app.db import Store, get_store
 from app.providers import (
     ManifestError,
     Provider,
-    file_providers,
+    load_manifest,
     load_manifest_text,
     reload_providers,
     set_stored_loader,
@@ -60,30 +68,25 @@ logger = logging.getLogger(__name__)
 def writable_name(name: str) -> str:
     """The reason this provider name may not be stored, or empty if it may.
 
-    A shipped file cannot be redefined by a row. `spotify.toml` and `github.toml`
-    are reviewed code and the reference implementations of the format; a stored row
-    claiming one of those names would silently change where an existing connection's
-    credential is sent, on an account the user connected long before.
+    Every name is writable now. This used to refuse the two shipped files, and the
+    refusal is what made a missing Spotify operation a code change; see the module
+    docstring. It stays as a function because the *rest* of the write path calls it
+    and a future reservation (a name the runtime itself uses) would belong here
+    rather than scattered across three call sites.
     """
     name = (name or "").strip().lower()
     if not name:
         return "A manifest needs a name."
-    if name in file_providers():
-        return (
-            f"{name!r} is shipped with Bloom as a reviewed file and cannot be "
-            "redefined by a stored manifest. If the shipped one is wrong, that is a "
-            "code change; if you need different behaviour, choose another name."
-        )
     return ""
 
 
 def stored_providers(store: Store | None = None) -> dict[str, Provider]:
     """Every manifest in the database that still parses, by name.
 
-    A row that no longer validates is logged and skipped rather than raised — the
-    same tolerance `file_providers` applies, and it matters more here. These rows
-    hold model output and arrive from other installs, so one bad manifest must cost
-    exactly one provider and never the service's ability to start.
+    A row that no longer validates is logged and skipped rather than raised: one
+    bad manifest must cost exactly one provider and never the service's ability to
+    start. That matters more than it looks now that these rows are the only source
+    of providers there is — they hold model output and arrive from other installs.
     """
     store = store or get_store()
     found: dict[str, Provider] = {}
@@ -126,8 +129,59 @@ def install_loader(store: Store | None = None) -> None:
 
 
 def uninstall_loader() -> None:
-    """Detach the database source. Leaves file manifests working on their own."""
+    """Detach the database source. Nothing is left — every manifest is a row."""
     set_stored_loader(None)
+
+
+def seed_from_dir(directory: Path | str, store: Store | None = None) -> list[str]:
+    """Import ``*.toml`` from a directory as ordinary rows. Returns names imported.
+
+    The one supported way a manifest reaches Bloom from disk, and deliberately weak:
+    it **never overwrites** a name that already has a row, and what it writes is an
+    ordinary editable manifest with ``source='seed'`` — not a tier, not an override.
+    That is the whole difference from the shipped files this replaced. A seeded
+    manifest can be edited by the builder, by `/admin/manifests`, and by asking, the
+    same as one written here; re-running the import will not undo those edits.
+
+    Unset by default, so a stock Bloom starts with no providers at all and learns
+    every one of them. It exists for the cases where that is not what you want: a
+    test fixture, an install restoring from an export, an operator with a manifest
+    they would rather not have researched twice.
+
+    A file that does not parse is logged and skipped — importing four of five
+    manifests beats refusing to start over the fifth.
+    """
+    store = store or get_store()
+    directory = Path(directory)
+    if not directory.is_dir():
+        logger.warning("Manifest seed directory %s does not exist; nothing imported", directory)
+        return []
+
+    existing = set(stored_providers(store))
+    imported: list[str] = []
+    for path in sorted(directory.glob("*.toml")):
+        try:
+            provider = load_manifest(path)
+        except ManifestError:
+            logger.exception("Ignoring seed manifest %s", path.name)
+            continue
+        if provider.name in existing:
+            continue
+        try:
+            save(
+                name=provider.name,
+                toml=path.read_text(encoding="utf-8"),
+                source="seed",
+                store=store,
+            )
+        except ManifestError:
+            logger.exception("Ignoring seed manifest %s", path.name)
+            continue
+        imported.append(provider.name)
+
+    if imported:
+        logger.info("Seeded %d provider manifest(s): %s", len(imported), ", ".join(imported))
+    return imported
 
 
 def save(
@@ -191,6 +245,7 @@ __all__ = [
     "install_loader",
     "mark_verified",
     "save",
+    "seed_from_dir",
     "stored_providers",
     "uninstall_loader",
     "writable_name",

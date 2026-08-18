@@ -664,16 +664,25 @@ def test_a_rejected_manifest_comes_back_as_prose_so_the_model_can_fix_it(broker,
     assert provider_store.get_manifest("analytics") is None
 
 
-def test_the_builder_cannot_redefine_a_shipped_provider(broker, provider_store):
-    """The attack needing no new credential: repoint one somebody already connected."""
-    out = call(
-        broker,
-        "bloom_write_provider_manifest",
-        name="spotify",
-        toml=MANIFEST.replace('name = "analytics"', 'name = "spotify"'),
-    )
-    assert "shipped with Bloom" in out
-    assert provider_store.get_manifest("spotify") is None
+def test_the_builder_can_read_a_manifest_in_order_to_extend_it(broker, provider_store):
+    """Extending was unexpressible: nothing handed back the source to extend.
+
+    `bloom_list_providers` prints a summary line and the write tool replaces the
+    whole document, so the only way to add one operation was to re-derive the entire
+    manifest from the docs — which is how operations that already worked get dropped.
+    """
+    call(broker, "bloom_write_provider_manifest", name="analytics", toml=MANIFEST)
+
+    out = call(broker, "bloom_get_provider_manifest", name="analytics")
+    assert 'name = "analytics"' in out  # the actual TOML, not a summary of it
+    assert "replaces rather" in out  # and the warning that comes with editing it
+
+
+def test_reading_a_manifest_that_is_not_there_names_what_is(broker, provider_store):
+    """A model that mistyped a provider name should not conclude the service is absent."""
+    out = call(broker, "bloom_get_provider_manifest", name="spotifyy")
+    assert "No provider manifest named 'spotifyy'" in out
+    assert "spotify" in out
 
 
 def test_a_manifest_with_no_tools_at_all_is_stored_but_flagged(broker, provider_store):
@@ -688,11 +697,28 @@ def test_a_manifest_with_no_tools_at_all_is_stored_but_flagged(broker, provider_
     assert "no tools at all" in out
 
 
-def test_listing_providers_says_a_missing_one_is_not_a_dead_end(broker, provider_store):
-    """The prompt's fallback order only works if this does not read as terminal."""
+def test_listing_providers_says_an_empty_bloom_is_not_a_dead_end(broker, provider_store):
+    """The state a stock install now starts in: no providers at all.
+
+    It used to be unreachable — two manifests shipped, so this branch only ran on a
+    broken checkout. It is the default now, which makes the wording load-bearing:
+    the prompt's fallback order only works if this does not read as terminal.
+    """
     out = call(broker, "bloom_list_providers")
+    assert "no provider manifests at all" in out
     assert "bloom_write_provider_manifest" in out
-    assert "[shipped]" in out
+
+
+def test_listing_providers_says_where_each_one_came_from(broker, provider_store):
+    """Provenance is the only thing left that distinguishes manifests from each other."""
+    call(broker, "bloom_write_provider_manifest", name="analytics", toml=MANIFEST)
+
+    out = call(broker, "bloom_list_providers")
+    assert "[written here]" in out
+    # An existing manifest is not necessarily a sufficient one, and this is where the
+    # builder is told so — the failure it prevents is a build that finishes with an
+    # agent missing the one operation it was asked for.
+    assert "bloom_get_provider_manifest" in out
 
 
 def test_the_manifest_format_reference_is_available_as_a_tool(broker):

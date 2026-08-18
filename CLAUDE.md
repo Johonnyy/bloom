@@ -412,8 +412,33 @@ redeploy, which contradicts the whole premise — a capability is a row in a tab
 builder researches the API with `read_url`, calls `bloom_list_manifest_format`, and
 writes with `bloom_write_provider_manifest`; the manifest is live in the same run, so
 it can create the connection immediately rather than reporting success and waiting
-for a restart. Two files remain in `app/providers/` as reference implementations, and
-`providers()` unions them with stored rows.
+for a restart. **Nothing ships.** `app/providers/` holds the loader and no manifests
+at all; `providers()` is stored rows and only stored rows.
+
+That last part changed after a failure worth keeping. `spotify.toml` and `github.toml`
+used to stay as reviewed reference implementations that beat any row of the same name,
+which sounded conservative and was the opposite: the two services most likely to be
+connected already were the two whose gaps could not be repaired. Spotify shipped
+without a `next` operation, so "skip this song" was unanswerable — the agent ran,
+called nothing, and reported success, while the user's own OAuth grant already carried
+`user-modify-playback-state`. The capability was there; only the definition was
+missing, and the definition was the one part nobody could reach without a pull request.
+The reference the builder needs is `app/builder/manifest_format.py`, which teaches the
+*shape* without deciding what exists. The two files live on as test fixtures in
+`tests/fixtures/`.
+
+**Extending a manifest is the normal fix for a missing capability**, and the builder
+is pushed hard toward it: `bloom_get_provider_manifest` returns the current TOML,
+`bloom_write_provider_manifest` takes the whole document back under the same name, and
+both the tool descriptions and the prompt say that a write *replaces* rather than
+merges. A rebuilt agent never adds a tool — the tools come from the provider, resolved
+per run in `runtime_service.py` — so an agent picks up new operations on its next run
+with no rebuild and no reconnect.
+
+`BLOOM_MANIFEST_SEED_DIR` (unset by default) imports `*.toml` from a directory as
+ordinary rows: never overwriting a name that already exists, and producing something
+editable exactly like one the builder wrote. It is how the tests get their two worked
+examples, and how an operator restores an export — deliberately not a tier.
 
 **A manifest is not inert data**, which is the whole difficulty:
 `register_operations` turns each entry into a callable tool and `CredentialResolver`
@@ -421,14 +446,16 @@ attaches a live token to every request it makes. Four things pay for the trade, 
 [docs/provider-manifests-future.md](docs/provider-manifests-future.md) prices each:
 
 1. `load_manifest_text(trusted=False)` — endpoints must be https and pass the SSRF
-   check `read_url` uses, no `DELETE`, ≤20 operations, ≤16 KB, on top of every rule a
-   file manifest already passed. The metadata-service case is the one that matters:
-   without it, a manifest naming `169.254.169.254` turns the credential resolver into
-   an authenticated client of the instance's own identity service;
-2. **a file always wins** — enforced at the write path (`writable_name`) *and* in
-   `providers()`, in two modules, because only one of them is on the path a manifest
-   arriving from the sync store takes. A stored row cannot repoint `spotify`, which
-   is the attack needing no new credential at all;
+   check `read_url` uses, no `DELETE`, ≤20 operations, ≤16 KB. The metadata-service
+   case is the one that matters: without it, a manifest naming `169.254.169.254`
+   turns the credential resolver into an authenticated client of the instance's own
+   identity service;
+2. **an existing local row always wins** over anything pulled from the sync store,
+   which is what stops somebody else's model repointing a provider you already have
+   a credential attached to — the attack needing no new credential at all. This
+   replaced a rule that let two shipped files outrank every row; that version also
+   stopped *you* fixing your own manifest, which is how a Spotify agent ended up
+   unable to skip a track with the right scope already granted;
 3. **the credential is the real gate**, and it always was — a manifest does nothing
    until a human attaches an account. What that human lacked was the one checkable
    fact, which `ConnectionOut.credential_hosts` now carries: "your key will be sent to

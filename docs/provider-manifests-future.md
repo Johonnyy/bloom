@@ -45,9 +45,30 @@ up exactly:
   "which run wrote this" is the first question anyone asks;
 - reverting is `DELETE FROM`, or one button, rather than an ssh session.
 
-Shipped files and stored rows are unioned by `providers()`, and **a file always
-wins**. `spotify.toml` and `github.toml` stay as the reference implementations of
-the format and cannot be redefined by anything a model writes.
+`providers()` reads stored rows and nothing else.
+
+**The two shipped files were removed, and that is a correction rather than a
+tightening.** `spotify.toml` and `github.toml` were kept as reference
+implementations that beat any row of the same name — which sounded conservative and
+inverted the whole point. The two services most likely to already have a live
+credential attached were the two whose definitions could not be repaired without a
+release. It failed exactly there: Spotify shipped with `play`, `pause`, `search` and
+`now_playing` and no `next`, so "skip this song" ran an agent that called nothing and
+reported success, while the user's grant already carried
+`user-modify-playback-state`. The capability existed, the definition did not, and the
+definition was the one part that needed a pull request.
+
+What replaced the precedence rule is weaker on paper and stronger in practice: a
+manifest arriving from the sync store is ignored when a local row of that name
+exists. That covers strictly more cases, since every provider anyone has actually
+connected to has a row — and unlike the file rule, it does not also block the owner
+of the install from fixing their own manifest.
+
+The format's worked examples now live in `app/builder/manifest_format.py` (a
+reference, not a provider) and in `tests/fixtures/`, where they are still parsed and
+asserted on every run. `BLOOM_MANIFEST_SEED_DIR` imports a directory of manifests as
+ordinary editable rows, never overwriting a name that already exists — an on-ramp,
+not a tier.
 
 ## What it costs
 
@@ -55,7 +76,7 @@ Every concern that argued against this is still true. Each is now priced:
 
 **A model authors the file that defines HTTP calls made with your credentials.**
 Unchanged, and it is the real cost. `load_manifest_text(trusted=False)` adds, on top
-of every rule a file manifest already passed: `api_base`/`authorize_url`/`token_url`/
+of the rules every manifest passes: `api_base`/`authorize_url`/`token_url`/
 `revoke_url` must be https and pass the same SSRF host check `read_url` uses; no
 `DELETE` operation; at most 20 operations and 16 KB. The metadata-service case
 (`https://169.254.169.254`) is the one that mattered most — without that check a

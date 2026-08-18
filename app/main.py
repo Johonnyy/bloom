@@ -80,12 +80,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     assert_usable(settings_now, stored_connections=await asyncio.to_thread(store.count_connections))
 
-    # Before anything reads `providers()`: a provider is now a shipped file *or* a
-    # stored row, and a connection resolved against the file-only view would report
-    # "no manifest for that provider" for one the builder wrote last week.
-    from app.manifests import install_loader
+    # Before anything reads `providers()`: every provider is a stored row, so a
+    # connection resolved before this runs would report "no manifest for that
+    # provider" for one the builder wrote last week.
+    from app.manifests import install_loader, seed_from_dir
 
     install_loader(store)
+    if settings_now.manifest_seed_dir:
+        await asyncio.to_thread(seed_from_dir, settings_now.manifest_seed_dir, store)
 
     await asyncio.to_thread(store.sweep_abandoned_runs)
     # Runs and builds are swept separately because they fail differently: the run

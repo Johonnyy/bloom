@@ -62,11 +62,9 @@ from app.urlsafety import host_of, https_public
 
 logger = logging.getLogger(__name__)
 
-MANIFEST_DIR = Path(__file__).resolve().parent
-
-# Bounds on a manifest a *model* wrote. Generous enough never to bite a real
-# provider, small enough that a generation which does not stop cannot fill the
-# database. A file manifest is exempt: it went through review.
+# Bounds on a manifest a *model* wrote — which is now every manifest. Generous
+# enough never to bite a real provider, small enough that a generation which does
+# not stop cannot fill the database.
 MAX_STORED_OPERATIONS = 20
 MAX_STORED_TOML_BYTES = 16_384
 
@@ -208,11 +206,12 @@ class Provider:
     auth_style: str = "basic"  # basic | body
     docs_url: str = ""
     revoke_url: str = ""
-    # Where this definition came from: `file` is reviewed code in app/providers,
-    # `stored` was written by the builder on this install, `shared` was pulled from
-    # the sync store. Only `file` has had a human read it, which is exactly what a
-    # person about to paste an API key needs to be told.
-    source: str = "file"
+    # Where this definition came from: `stored` was written by the builder on this
+    # install, `shared` was pulled from the sync store, `seed` was imported from a
+    # directory an operator pointed at. None of the three has had a human read it,
+    # which is why `credential_hosts()` rather than provenance is what the connection
+    # screen leads with.
+    source: str = "stored"
     # Whether this provider also offers the bounded escape hatch — see
     # `_make_request_caller`. Off unless the manifest asks for it.
     allow_request: bool = False
@@ -223,8 +222,16 @@ class Provider:
 
     @property
     def reviewed(self) -> bool:
-        """Whether a human has read this definition. False for anything a model wrote."""
-        return self.source == "file"
+        """Whether a human has read this definition. Now always false, and honestly so.
+
+        Bloom used to ship two manifests as reviewed code and let them outrank any
+        stored row. That tier is gone — it made a missing operation in one of them a
+        pull request — so nothing here carries a human's signature any more. The
+        field stays because the answer is still worth telling a UI, and because
+        something a person *has* signed off could reappear later; what would be
+        dishonest is quietly reporting `true` for text a model wrote.
+        """
+        return False
 
     def credential_hosts(self) -> tuple[str, ...]:
         """Every host a credential for this provider would be sent to.
@@ -480,7 +487,7 @@ def _check_stored_bounds(where: str, raw: dict, operations: tuple[Operation, ...
 
 
 def load_manifest_text(
-    text: str, *, where: str, trusted: bool = True, source: str = "file"
+    text: str, *, where: str, trusted: bool = True, source: str = "stored"
 ) -> Provider:
     """Parse and validate one manifest, from its TOML text.
 
@@ -562,27 +569,16 @@ def load_manifest_text(
     )
 
 
-def load_manifest(path: Path) -> Provider:
-    """Parse and validate one manifest file."""
-    return load_manifest_text(path.read_text(encoding="utf-8"), where=path.name, trusted=True)
+def load_manifest(path: Path, *, trusted: bool = False, source: str = "seed") -> Provider:
+    """Parse and validate one manifest file.
 
-
-def file_providers() -> dict[str, Provider]:
-    """Every manifest shipped as a file in ``app/providers``, by name.
-
-    A malformed manifest is fatal for that provider only — it is logged and
-    skipped, so one bad file cannot stop the service from starting and taking
-    every other provider down with it.
+    Strict by default. There is no reviewed-file tier any more, so a manifest read
+    off disk is held to exactly the rules a manifest the builder wrote must pass —
+    the only difference left is where the bytes came from.
     """
-    found: dict[str, Provider] = {}
-    for path in sorted(MANIFEST_DIR.glob("*.toml")):
-        try:
-            provider = load_manifest(path)
-        except ManifestError:
-            logger.exception("Ignoring provider manifest %s", path.name)
-            continue
-        found[provider.name] = provider
-    return found
+    return load_manifest_text(
+        path.read_text(encoding="utf-8"), where=path.name, trusted=trusted, source=source
+    )
 
 
 #: Set by `app.manifests.install_loader` at import of the store layer. A function
@@ -601,18 +597,23 @@ def set_stored_loader(loader: Callable[[], dict[str, Provider]] | None) -> None:
 
 @lru_cache
 def providers() -> dict[str, Provider]:
-    """Every provider this Bloom can reach: shipped files unioned with stored rows.
+    """Every provider this Bloom can reach. All of them are rows.
 
-    **A file always wins.** `spotify.toml` and `github.toml` are reviewed code and
-    are the reference implementations; a stored row that claimed one of those names
-    would silently redefine where a credential goes. The write path refuses the name
-    outright, and this is the second half of that guarantee — belt and braces,
-    because the two are enforced in different modules and only one of them is
-    reached by a manifest arriving from the sync store.
+    Bloom used to ship `spotify.toml` and `github.toml` in this package and let a
+    file beat a stored row of the same name. That made the two services most likely
+    to already be connected the two that could not be repaired by asking — the
+    refusal pointed at a code change and a redeploy, which is the deploy gate the
+    builder exists to remove. Both files are test fixtures now, and a provider is
+    data end to end: written by the builder, editable through `/admin/manifests`,
+    reachable in natural language.
 
-    Still cached, but no longer for the lifetime of the process: `reload_providers`
-    is called whenever a stored manifest is written, so a manifest the builder wrote
-    is live inside the same run rather than after a restart.
+    Nothing was given up to do it. The rules that make a model-authored manifest
+    safe live in `load_manifest_text(trusted=False)` and apply to every manifest
+    here, and the real gate was never the file — it is the human attaching a
+    credential, told which hosts it will be sent to.
+
+    Cached, but not for the process lifetime: `reload_providers` runs whenever a
+    manifest is written, so one the builder just wrote is live inside the same run.
     """
     found: dict[str, Provider] = {}
     if _stored_loader is not None:
@@ -620,10 +621,6 @@ def providers() -> dict[str, Provider]:
             found.update(_stored_loader())
         except Exception:  # noqa: BLE001 — a bad row must not take the service down
             logger.exception("Could not load stored provider manifests")
-    for name, provider in file_providers().items():
-        if name in found:
-            logger.warning("Stored manifest %r shadowed by the shipped file; file wins", name)
-        found[name] = provider
     logger.info("Loaded %d provider manifest(s): %s", len(found), ", ".join(sorted(found)) or "-")
     return found
 

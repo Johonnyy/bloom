@@ -13,12 +13,12 @@ here, now; a background pass that quietly restored the broken shared copy an hou
 later would make that fix a lie. A pulled manifest is written only when there is no
 local row for that name.
 
-**A file always wins over both.** `manifests.save` refuses a name that
-`file_providers()` defines, so a shared manifest claiming ``spotify`` cannot
-redefine where an existing Spotify connection sends its credential. That check is
-in `app.manifests` rather than repeated here on purpose — this is the path where
-somebody *else's* model chose the name, so it is the path that most needs the
-single enforcement point rather than a second copy of the rule.
+**Local always wins**, and that is now the only precedence rule there is. Bloom
+used to also refuse any shared manifest whose name matched a shipped file; there
+are no shipped files, so a name is simply taken or it is not. A shared manifest
+cannot redefine an existing connection's provider because a local row for that
+name already exists — which is the same protection, resting on a fact about this
+install rather than on a fact about the repo.
 
 **Pulled manifests are validated exactly as locally-written ones are.** They arrive
 with ``trusted=False``, through the same loader, because the sync store deliberately
@@ -43,7 +43,7 @@ from typing import Any
 from app.config import Settings, get_settings
 from app.db import Store, get_store
 from app.manifests import save, writable_name
-from app.providers import ManifestError, file_providers
+from app.providers import ManifestError
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +176,6 @@ async def pull(
         return 0
 
     existing = {row["name"] for row in await asyncio.to_thread(store.list_manifests)}
-    shipped = set(file_providers())
     adopted = 0
 
     for name, record in shared.items():
@@ -186,9 +185,6 @@ async def pull(
         # Aperture — that route exists precisely so a wrong manifest is fixable, and
         # restoring the broken shared copy an hour later would make the fix a lie.
         if name in existing:
-            continue
-        if name in shipped:
-            logger.info("Shared manifest %s ignored: this Bloom ships one under that name", name)
             continue
         if writable_name(name):
             continue
